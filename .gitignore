@@ -1,0 +1,25 @@
+# global .gitignore이 .omc/를 제외하므로 명시적으로 재포함
+!.omc/
+# OMC runtime state만 제외 (ephemeral, not source of truth)
+.omc/state/
+
+# Claude Code 로컬 전용 설정 (사용자 머신마다 다름)
+.claude/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Tauri / Rust (구현 단계에서 사용)
+target/
+dist/
+node_modules/
+src-tauri/target/
+
+# 환경 변수
+.env
+.env.local
