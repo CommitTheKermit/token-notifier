@@ -19,6 +19,7 @@ target/
 dist/
 node_modules/
 src-tauri/target/
+src-tauri/gen/
 
 # 환경 변수
 .env
