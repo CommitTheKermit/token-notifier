@@ -2,11 +2,9 @@ pub mod config;
 pub mod parser;
 pub mod scheduler;
 pub mod storage;
+pub mod tray;
 pub mod window_estimator;
 
-use tauri::tray::TrayIconBuilder;
-
-const INITIAL_TRAY_TITLE: &str = "CC --%  CX --%";
 
 pub fn run() {
     tauri::Builder::default()
@@ -16,11 +14,7 @@ pub fn run() {
         // Tauri plugin default examples use LaunchAgent, so wiring autostart
         // here would change the approved mechanism prematurely.
         .setup(|app| {
-            TrayIconBuilder::with_id("main")
-                .title(INITIAL_TRAY_TITLE)
-                .tooltip("Token Notifier")
-                .build(app)?;
-
+            tray::build_main_tray(app)?;
             Ok(())
         })
         .run(tauri::generate_context!())
