@@ -47,7 +47,15 @@ fields.form.addEventListener('submit', async (event) => {
   try {
     const saved = await invoke('save_settings', { settings: readForm() });
     render(saved);
-    fields.status.textContent = 'Saved';
+    if (saved.autostart_enabled) {
+      const status = await invoke('get_autostart_status');
+      fields.status.textContent = status === 'RequiresApproval'
+        ? 'Saved. Approve Token Notifier in System Settings → Login Items.'
+        : `Saved. Autostart: ${status}`;
+      if (status === 'RequiresApproval') await invoke('open_login_items_settings');
+    } else {
+      fields.status.textContent = 'Saved';
+    }
   } catch (error) {
     fields.status.textContent = `Save failed: ${error}`;
   }
