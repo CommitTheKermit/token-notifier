@@ -99,21 +99,17 @@ pub fn build_main_tray(app: &App) -> tauri::Result<TrayIcon> {
                 }
             ) {
                 let app = tray.app_handle();
-                if let Some(window) = app.get_webview_window("popover") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                } else {
-                    let _ = WebviewWindowBuilder::new(
-                        app,
-                        "popover",
-                        WebviewUrl::App("popover.html".into()),
-                    )
-                    .title("Token Notifier")
-                    .inner_size(560.0, 380.0)
-                    .resizable(false)
-                    .visible(true)
-                    .build();
+                open_or_focus_window(app, "popover", "popover.html", "Token Notifier", 560.0, 380.0);
+            } else if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Right,
+                    button_state: MouseButtonState::Up,
+                    ..
                 }
+            ) {
+                let app = tray.app_handle();
+                open_or_focus_window(app, "settings", "settings.html", "Token Notifier Settings", 460.0, 520.0);
             }
         })
         .build(app)
@@ -196,5 +192,26 @@ mod tests {
         state.cx.estimated = true;
         let label = format_tray_label(&state);
         assert!(label.contains("CX ~ 91% ↻5m"));
+    }
+}
+
+fn open_or_focus_window<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    label: &str,
+    url: &str,
+    title: &str,
+    width: f64,
+    height: f64,
+) {
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.show();
+        let _ = window.set_focus();
+    } else {
+        let _ = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+            .title(title)
+            .inner_size(width, height)
+            .resizable(false)
+            .visible(true)
+            .build();
     }
 }

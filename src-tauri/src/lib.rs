@@ -2,11 +2,13 @@ pub mod alerts;
 pub mod config;
 pub mod parser;
 pub mod scheduler;
+pub mod settings;
 pub mod storage;
 pub mod tray;
 pub mod window_estimator;
 
 use chrono::Utc;
+use tauri::Emitter;
 
 #[tauri::command]
 fn get_24h_series() -> Result<Vec<storage::HourlyPoint>, String> {
@@ -22,10 +24,25 @@ fn get_rollups() -> Result<Vec<storage::Rollups>, String> {
     store.get_rollups(Utc::now()).map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn get_settings() -> settings::AppSettings {
+    settings::load_settings()
+}
+
+#[tauri::command]
+fn save_settings<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    settings: settings::AppSettings,
+) -> Result<settings::AppSettings, String> {
+    let saved = settings::save_settings(&settings).map_err(|error| error.to_string())?;
+    app.emit("settings-reloaded", &saved).map_err(|error| error.to_string())?;
+    Ok(saved)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
-        .invoke_handler(tauri::generate_handler![get_24h_series, get_rollups])
+        .invoke_handler(tauri::generate_handler![get_24h_series, get_rollups, get_settings, save_settings])
         // Step 2 intentionally does not initialize tauri-plugin-autostart.
         // The plan preserves macOS 13+ SMAppService for Step 9; the current
         // Tauri plugin default examples use LaunchAgent, so wiring autostart
