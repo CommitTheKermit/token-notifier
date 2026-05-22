@@ -86,12 +86,14 @@ pub fn format_tray_label(state: &TrayDisplayState) -> String {
 }
 
 pub fn build_main_tray(app: &App) -> tauri::Result<TrayIcon> {
+    let initial_title = format_tray_label(&TrayDisplayState::empty(Utc::now()));
+    crate::native_status::install_initial(&app.handle().clone(), initial_title.clone());
     let icon = tray_status_icon();
 
     TrayIconBuilder::with_id(MAIN_TRAY_ID)
         .icon(icon)
         .icon_as_template(true)
-        .title(format_tray_label(&TrayDisplayState::empty(Utc::now())))
+        .title(initial_title)
         .tooltip("Token Notifier")
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
@@ -138,8 +140,10 @@ pub fn update_main_tray<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &TrayDisplayState,
 ) -> tauri::Result<()> {
+    let title = format_tray_label(state);
+    crate::native_status::update_title(app, title.clone());
     if let Some(tray) = app.tray_by_id(MAIN_TRAY_ID) {
-        tray.set_title(Some(format_tray_label(state)))?;
+        tray.set_title(Some(title))?;
     }
     Ok(())
 }

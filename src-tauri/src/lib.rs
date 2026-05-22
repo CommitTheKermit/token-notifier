@@ -1,6 +1,7 @@
 pub mod alerts;
 pub mod autostart;
 pub mod config;
+pub mod native_status;
 pub mod parser;
 pub mod runtime;
 pub mod scheduler;
