@@ -1,3 +1,8 @@
+pub mod config;
+pub mod parser;
+pub mod storage;
+pub mod window_estimator;
+
 use tauri::tray::TrayIconBuilder;
 
 const INITIAL_TRAY_TITLE: &str = "CC --%  CX --%";
