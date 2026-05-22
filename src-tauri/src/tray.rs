@@ -3,7 +3,7 @@ use crate::window_estimator::UsageSnapshot;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{App, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{image::Image, App, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub const MAIN_TRAY_ID: &str = "main";
 
@@ -86,9 +86,14 @@ pub fn format_tray_label(state: &TrayDisplayState) -> String {
 }
 
 pub fn build_main_tray(app: &App) -> tauri::Result<TrayIcon> {
+    let icon = tray_status_icon();
+
     TrayIconBuilder::with_id(MAIN_TRAY_ID)
+        .icon(icon)
+        .icon_as_template(true)
         .title(format_tray_label(&TrayDisplayState::empty(Utc::now())))
         .tooltip("Token Notifier")
+        .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
             if matches!(
                 event,
@@ -228,4 +233,20 @@ fn open_or_focus_window<R: tauri::Runtime>(
             .visible(true)
             .build();
     }
+}
+
+fn tray_status_icon() -> Image<'static> {
+    let size = 18u32;
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    let center = (size as f32 - 1.0) / 2.0;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let alpha = if distance <= 7.0 { 255 } else { 0 };
+            rgba.extend_from_slice(&[0, 0, 0, alpha]);
+        }
+    }
+    Image::new_owned(rgba, size, size)
 }

@@ -78,6 +78,8 @@ pub fn run() {
         // tauri-plugin-autostart remains available but is not initialized in its
         // documented LaunchAgent mode, preserving the approved macOS 13+ decision.
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             tray::build_main_tray(app)?;
             runtime::start_background_runtime(app.handle().clone())
                 .map_err(|error| tauri::Error::Anyhow(error.into()))?;
