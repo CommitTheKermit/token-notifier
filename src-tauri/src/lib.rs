@@ -2,6 +2,7 @@ pub mod autostart;
 pub mod alerts;
 pub mod config;
 pub mod parser;
+pub mod runtime;
 pub mod scheduler;
 pub mod settings;
 pub mod storage;
@@ -64,6 +65,8 @@ pub fn run() {
         // documented LaunchAgent mode, preserving the approved macOS 13+ decision.
         .setup(|app| {
             tray::build_main_tray(app)?;
+            runtime::start_background_runtime(app.handle().clone())
+                .map_err(|error| tauri::Error::Anyhow(error.into()))?;
             Ok(())
         })
         .run(tauri::generate_context!())
