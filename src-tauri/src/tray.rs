@@ -2,8 +2,8 @@ use crate::parser::UsageSource;
 use crate::window_estimator::UsageSnapshot;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tauri::tray::{TrayIcon, TrayIconBuilder};
-use tauri::App;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tauri::{App, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub const MAIN_TRAY_ID: &str = "main";
 
@@ -89,6 +89,33 @@ pub fn build_main_tray(app: &App) -> tauri::Result<TrayIcon> {
     TrayIconBuilder::with_id(MAIN_TRAY_ID)
         .title(format_tray_label(&TrayDisplayState::empty(Utc::now())))
         .tooltip("Token Notifier")
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                let app = tray.app_handle();
+                if let Some(window) = app.get_webview_window("popover") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                } else {
+                    let _ = WebviewWindowBuilder::new(
+                        app,
+                        "popover",
+                        WebviewUrl::App("popover.html".into()),
+                    )
+                    .title("Token Notifier")
+                    .inner_size(560.0, 380.0)
+                    .resizable(false)
+                    .visible(true)
+                    .build();
+                }
+            }
+        })
         .build(app)
 }
 

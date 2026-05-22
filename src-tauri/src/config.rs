@@ -64,3 +64,8 @@ fn default_cc_quota_tokens() -> u64 {
 fn default_cx_quota_tokens() -> u64 {
     DEFAULT_CX_QUOTA_TOKENS
 }
+
+
+pub fn database_path() -> Option<PathBuf> {
+    app_support_dir().map(|dir| dir.join("usage.sqlite"))
+}

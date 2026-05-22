@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'" />
+    <title>Token Notifier</title>
+    <link rel="stylesheet" href="popover.css" />
+    <script src="vendor/chart.umd.js" defer></script>
+    <script type="module" src="popover.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Usage pattern</h1>
+        <p>Last 24 hours</p>
+      </header>
+      <canvas id="usage-chart" width="520" height="220" aria-label="24 hour usage line graph"></canvas>
+      <section class="rollups" aria-label="Usage rollups">
+        <article><span>Today</span><strong id="rollup-day">--</strong></article>
+        <article><span>This week</span><strong id="rollup-week">--</strong></article>
+        <article><span>This month</span><strong id="rollup-month">--</strong></article>
+      </section>
+    </main>
+  </body>
+</html>
