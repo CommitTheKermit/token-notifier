@@ -1,3 +1,4 @@
+pub mod alerts;
 pub mod config;
 pub mod parser;
 pub mod scheduler;
