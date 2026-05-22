@@ -129,25 +129,35 @@ mod tests {
     #[test]
     fn oscillation_inside_window_is_absorbed() {
         let store = UsageStore::in_memory().unwrap();
-        assert!(ThresholdEvaluator::evaluate(&store, &snapshot(76, "cc:1"), &[75])
-            .unwrap()
-            .is_some());
-        assert!(ThresholdEvaluator::evaluate(&store, &snapshot(65, "cc:1"), &[75])
-            .unwrap()
-            .is_none());
-        assert!(ThresholdEvaluator::evaluate(&store, &snapshot(76, "cc:1"), &[75])
-            .unwrap()
-            .is_none());
+        assert!(
+            ThresholdEvaluator::evaluate(&store, &snapshot(76, "cc:1"), &[75])
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ThresholdEvaluator::evaluate(&store, &snapshot(65, "cc:1"), &[75])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ThresholdEvaluator::evaluate(&store, &snapshot(76, "cc:1"), &[75])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn next_window_can_emit_again() {
         let store = UsageStore::in_memory().unwrap();
-        assert!(ThresholdEvaluator::evaluate(&store, &snapshot(76, "cc:1"), &[75])
-            .unwrap()
-            .is_some());
-        assert!(ThresholdEvaluator::evaluate(&store, &snapshot(76, "cc:2"), &[75])
-            .unwrap()
-            .is_some());
+        assert!(
+            ThresholdEvaluator::evaluate(&store, &snapshot(76, "cc:1"), &[75])
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ThresholdEvaluator::evaluate(&store, &snapshot(76, "cc:2"), &[75])
+                .unwrap()
+                .is_some()
+        );
     }
 }

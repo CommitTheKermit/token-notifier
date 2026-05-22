@@ -13,10 +13,14 @@ use tauri::{AppHandle, Emitter};
 use tokio::time::{self, Duration};
 
 pub fn start_background_runtime<R: tauri::Runtime>(app: AppHandle<R>) -> anyhow::Result<()> {
-    let db_path = database_path().ok_or_else(|| anyhow::anyhow!("Could not resolve database path"))?;
+    let db_path =
+        database_path().ok_or_else(|| anyhow::anyhow!("Could not resolve database path"))?;
     let store = UsageStore::open(db_path)?;
     let mut scheduler = UsageScheduler::new(
-        vec![Box::new(ClaudeCodeParser::new()), Box::new(CodexParser::new())],
+        vec![
+            Box::new(ClaudeCodeParser::new()),
+            Box::new(CodexParser::new()),
+        ],
         WindowEstimator::new(HiddenConfig::load()),
         store,
     );
@@ -68,7 +72,8 @@ fn handle_outcome<R: tauri::Runtime>(
     update_main_tray(app, &tray_state)?;
     app.emit("usage-update", &tray_state)?;
 
-    let db_path = database_path().ok_or_else(|| anyhow::anyhow!("Could not resolve database path"))?;
+    let db_path =
+        database_path().ok_or_else(|| anyhow::anyhow!("Could not resolve database path"))?;
     let alert_store = UsageStore::open(db_path)?;
     for snapshot in snapshots {
         let source_settings = match snapshot.source {
@@ -89,8 +94,7 @@ fn maybe_send_alert<R: tauri::Runtime>(
     if !settings.enabled {
         return Ok(());
     }
-    if let Some(notification) =
-        ThresholdEvaluator::evaluate(store, snapshot, &settings.thresholds)?
+    if let Some(notification) = ThresholdEvaluator::evaluate(store, snapshot, &settings.thresholds)?
     {
         send_notification(app, &notification)?;
     }

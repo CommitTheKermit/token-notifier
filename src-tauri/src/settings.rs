@@ -37,7 +37,8 @@ impl Default for AppSettings {
 
 impl AppSettings {
     pub fn normalized(mut self) -> Self {
-        self.claude_code.thresholds = ensure_at_least_one(normalized_thresholds(&self.claude_code.thresholds));
+        self.claude_code.thresholds =
+            ensure_at_least_one(normalized_thresholds(&self.claude_code.thresholds));
         self.codex.thresholds = ensure_at_least_one(normalized_thresholds(&self.codex.thresholds));
         self
     }

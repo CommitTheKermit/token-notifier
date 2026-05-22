@@ -99,7 +99,14 @@ pub fn build_main_tray(app: &App) -> tauri::Result<TrayIcon> {
                 }
             ) {
                 let app = tray.app_handle();
-                open_or_focus_window(app, "popover", "popover.html", "Token Notifier", 560.0, 380.0);
+                open_or_focus_window(
+                    app,
+                    "popover",
+                    "popover.html",
+                    "Token Notifier",
+                    560.0,
+                    380.0,
+                );
             } else if matches!(
                 event,
                 TrayIconEvent::Click {
@@ -109,7 +116,14 @@ pub fn build_main_tray(app: &App) -> tauri::Result<TrayIcon> {
                 }
             ) {
                 let app = tray.app_handle();
-                open_or_focus_window(app, "settings", "settings.html", "Token Notifier Settings", 460.0, 520.0);
+                open_or_focus_window(
+                    app,
+                    "settings",
+                    "settings.html",
+                    "Token Notifier Settings",
+                    460.0,
+                    520.0,
+                );
             }
         })
         .build(app)

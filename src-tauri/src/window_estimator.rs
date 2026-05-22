@@ -56,7 +56,9 @@ impl WindowEstimator {
                     tokens_used: 0,
                     estimated: false,
                 });
-                if state.window_start != metadata.window_start || state.reset_at != metadata.reset_at {
+                if state.window_start != metadata.window_start
+                    || state.reset_at != metadata.reset_at
+                {
                     *state = WindowState {
                         window_start: metadata.window_start,
                         reset_at: metadata.reset_at,
@@ -72,14 +74,21 @@ impl WindowEstimator {
             } else {
                 let default_window_secs = self.config.default_window_secs.max(60);
                 let quota = self.config.quota_for(event.source).max(1);
-                let state = self.states.entry(event.source).or_insert_with(|| WindowState {
-                    window_start: event.occurred_at,
-                    reset_at: event.occurred_at
-                        + Duration::seconds(default_window_secs.try_into().unwrap_or(DEFAULT_WINDOW_SECS as i64)),
-                    quota_tokens: quota,
-                    tokens_used: 0,
-                    estimated: true,
-                });
+                let state = self
+                    .states
+                    .entry(event.source)
+                    .or_insert_with(|| WindowState {
+                        window_start: event.occurred_at,
+                        reset_at: event.occurred_at
+                            + Duration::seconds(
+                                default_window_secs
+                                    .try_into()
+                                    .unwrap_or(DEFAULT_WINDOW_SECS as i64),
+                            ),
+                        quota_tokens: quota,
+                        tokens_used: 0,
+                        estimated: true,
+                    });
                 if event.occurred_at >= state.reset_at {
                     let windows_elapsed = ((event.occurred_at - state.window_start).num_seconds()
                         / default_window_secs as i64)

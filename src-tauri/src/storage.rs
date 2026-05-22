@@ -118,8 +118,9 @@ impl UsageStore {
 
     pub fn rollups_for(&self, source: UsageSource, now: DateTime<Utc>) -> anyhow::Result<Rollups> {
         let day = truncate_to_day(now).timestamp();
-        let week = truncate_to_day(now - Duration::days(now.weekday().num_days_from_monday() as i64))
-            .timestamp();
+        let week =
+            truncate_to_day(now - Duration::days(now.weekday().num_days_from_monday() as i64))
+                .timestamp();
         let month = Utc
             .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
             .single()
@@ -143,7 +144,12 @@ impl UsageStore {
         let changed = self.conn.execute(
             "INSERT OR IGNORE INTO threshold_state (source, window_id, threshold, notified_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![source.as_str(), window_id, threshold as i64, notified_at.timestamp()],
+            params![
+                source.as_str(),
+                window_id,
+                threshold as i64,
+                notified_at.timestamp()
+            ],
         )?;
         Ok(changed == 1)
     }
@@ -219,7 +225,11 @@ mod tests {
             .record_usage_event(&usage_event(UsageSource::ClaudeCode, at, 100))
             .unwrap();
         store
-            .record_usage_event(&usage_event(UsageSource::ClaudeCode, at + Duration::minutes(10), 50))
+            .record_usage_event(&usage_event(
+                UsageSource::ClaudeCode,
+                at + Duration::minutes(10),
+                50,
+            ))
             .unwrap();
 
         let series = store.get_24h_series(at).unwrap();

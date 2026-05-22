@@ -56,7 +56,8 @@ impl LocalLogParser for CodexParser {
             if delta == 0 {
                 continue;
             }
-            let occurred_at = parse_epoch_like_timestamp(updated_at).unwrap_or_else(chrono::Utc::now);
+            let occurred_at =
+                parse_epoch_like_timestamp(updated_at).unwrap_or_else(chrono::Utc::now);
             events.push(UsageEvent {
                 source: UsageSource::Codex,
                 event_id: format!("{thread_id}:{tokens_used}"),

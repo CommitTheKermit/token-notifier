@@ -50,7 +50,11 @@ impl ClaudeCodeParser {
         let metadata = fs::metadata(path)?;
         let size = metadata.len();
         let previous_offset = self.offsets.get(path).copied().unwrap_or(0);
-        let offset = if size < previous_offset { 0 } else { previous_offset };
+        let offset = if size < previous_offset {
+            0
+        } else {
+            previous_offset
+        };
 
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(offset))?;
