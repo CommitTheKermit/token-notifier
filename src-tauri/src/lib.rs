@@ -1,5 +1,6 @@
 pub mod config;
 pub mod parser;
+pub mod scheduler;
 pub mod storage;
 pub mod window_estimator;
 
