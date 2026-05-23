@@ -1,6 +1,6 @@
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::NativeStatusClick;
+    use super::{NativeStatusAnchor, NativeStatusClick};
     use objc2::{
         define_class, rc::Retained, runtime::AnyObject, sel, DeclaredClass, MainThreadMarker,
     };
@@ -115,12 +115,38 @@ mod macos {
             Some(NativeStatusClick::OpenPopover)
         }
     }
+
+    pub fn anchor_rect_on_main() -> Option<NativeStatusAnchor> {
+        let mtm = MainThreadMarker::new()?;
+        STATUS_STATE.with(|cell| {
+            let state = cell.borrow();
+            let item = &state.as_ref()?.item;
+            let button = item.button(mtm)?;
+            let window = button.window()?;
+            let button_frame = button.frame();
+            let window_frame = window.frame();
+            Some(NativeStatusAnchor {
+                x: window_frame.origin.x + button_frame.origin.x,
+                y: window_frame.origin.y + button_frame.origin.y,
+                width: button_frame.size.width,
+                height: button_frame.size.height,
+            })
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeStatusClick {
     OpenPopover,
     OpenSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NativeStatusAnchor {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 pub fn install_initial<R: tauri::Runtime>(
@@ -148,5 +174,16 @@ pub fn update_title<R: tauri::Runtime>(app: &tauri::AppHandle<R>, title: String,
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (app, title, tooltip);
+    }
+}
+
+pub fn anchor_rect() -> Option<NativeStatusAnchor> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::anchor_rect_on_main()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }

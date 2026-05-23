@@ -2,7 +2,7 @@ use crate::parser::UsageSource;
 use crate::window_estimator::UsageSnapshot;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tauri::{App, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{App, LogicalPosition, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::native_status::NativeStatusClick;
 
@@ -120,6 +120,7 @@ pub fn build_main_tray(app: &App) -> tauri::Result<()> {
                     "Token Notifier",
                     560.0,
                     380.0,
+                    true,
                 ),
                 NativeStatusClick::OpenSettings => open_or_focus_window(
                     &window_app,
@@ -128,6 +129,7 @@ pub fn build_main_tray(app: &App) -> tauri::Result<()> {
                     "Token Notifier Settings",
                     460.0,
                     520.0,
+                    false,
                 ),
             });
         }
@@ -248,16 +250,71 @@ fn open_or_focus_window<R: tauri::Runtime>(
     title: &str,
     width: f64,
     height: f64,
+    anchor_to_status: bool,
 ) {
     if let Some(window) = app.get_webview_window(label) {
+        if anchor_to_status {
+            position_window_below_status(app, &window, width, height);
+        }
         let _ = window.show();
         let _ = window.set_focus();
     } else {
-        let _ = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+        let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
             .title(title)
             .inner_size(width, height)
             .resizable(false)
-            .visible(true)
-            .build();
+            .visible(!anchor_to_status);
+        if anchor_to_status {
+            builder = builder
+                .decorations(false)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                .shadow(true);
+        }
+        if let Ok(window) = builder.build() {
+            if anchor_to_status {
+                position_window_below_status(app, &window, width, height);
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
     }
+}
+
+fn position_window_below_status<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    window: &WebviewWindow<R>,
+    width: f64,
+    height: f64,
+) {
+    if let Some(position) = popover_position_below_status(app, width, height) {
+        let _ = window.set_position(position);
+    }
+}
+
+fn popover_position_below_status<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    width: f64,
+    height: f64,
+) -> Option<LogicalPosition<f64>> {
+    let anchor = crate::native_status::anchor_rect()?;
+    let monitor = app.primary_monitor().ok().flatten();
+    let (screen_width, screen_height) = if let Some(monitor) = monitor {
+        let scale = monitor.scale_factor();
+        (
+            monitor.size().width as f64 / scale,
+            monitor.size().height as f64 / scale,
+        )
+    } else {
+        (1440.0, 900.0)
+    };
+
+    let margin = 8.0;
+    let x = (anchor.x + anchor.width / 2.0 - width / 2.0)
+        .max(margin)
+        .min((screen_width - width - margin).max(margin));
+    let y = (screen_height - anchor.y + 4.0)
+        .max(margin)
+        .min((screen_height - height - margin).max(margin));
+    Some(LogicalPosition::new(x, y))
 }
