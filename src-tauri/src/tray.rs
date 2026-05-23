@@ -2,10 +2,9 @@ use crate::parser::UsageSource;
 use crate::window_estimator::UsageSnapshot;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{image::Image, App, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{App, Manager, WebviewUrl, WebviewWindowBuilder};
 
-pub const MAIN_TRAY_ID: &str = "main";
+use crate::native_status::NativeStatusClick;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PercentColor {
@@ -97,56 +96,43 @@ pub fn format_tray_tooltip(state: &TrayDisplayState) -> String {
     }
 }
 
-pub fn build_main_tray(app: &App) -> tauri::Result<TrayIcon> {
+pub fn build_main_tray(app: &App) -> tauri::Result<()> {
     let initial_state = TrayDisplayState::empty(Utc::now());
     let initial_title = format_tray_label(&initial_state);
     let initial_tooltip = format_tray_tooltip(&initial_state);
-    crate::native_status::install_initial(&app.handle().clone(), initial_title.clone());
-    let icon = tray_status_icon();
-
-    TrayIconBuilder::with_id(MAIN_TRAY_ID)
-        .icon(icon)
-        .icon_as_template(true)
-        .tooltip(initial_tooltip)
-        .show_menu_on_left_click(false)
-        .on_tray_icon_event(|tray, event| {
-            if matches!(
-                event,
-                TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                }
-            ) {
-                let app = tray.app_handle();
-                open_or_focus_window(
-                    app,
+    let (click_sender, click_receiver) = std::sync::mpsc::channel();
+    crate::native_status::install_initial(
+        &app.handle().clone(),
+        initial_title,
+        initial_tooltip,
+        click_sender,
+    );
+    let app_handle = app.handle().clone();
+    std::thread::spawn(move || {
+        while let Ok(click) = click_receiver.recv() {
+            let app = app_handle.clone();
+            let window_app = app.clone();
+            let _ = app.run_on_main_thread(move || match click {
+                NativeStatusClick::OpenPopover => open_or_focus_window(
+                    &window_app,
                     "popover",
                     "popover.html",
                     "Token Notifier",
                     560.0,
                     380.0,
-                );
-            } else if matches!(
-                event,
-                TrayIconEvent::Click {
-                    button: MouseButton::Right,
-                    button_state: MouseButtonState::Up,
-                    ..
-                }
-            ) {
-                let app = tray.app_handle();
-                open_or_focus_window(
-                    app,
+                ),
+                NativeStatusClick::OpenSettings => open_or_focus_window(
+                    &window_app,
                     "settings",
                     "settings.html",
                     "Token Notifier Settings",
                     460.0,
                     520.0,
-                );
-            }
-        })
-        .build(app)
+                ),
+            });
+        }
+    });
+    Ok(())
 }
 
 pub fn update_main_tray<R: tauri::Runtime>(
@@ -155,10 +141,7 @@ pub fn update_main_tray<R: tauri::Runtime>(
 ) -> tauri::Result<()> {
     let title = format_tray_label(state);
     let tooltip = format_tray_tooltip(state);
-    crate::native_status::update_title(app, title.clone());
-    if let Some(tray) = app.tray_by_id(MAIN_TRAY_ID) {
-        tray.set_tooltip(Some(tooltip))?;
-    }
+    crate::native_status::update_title(app, title, tooltip);
     Ok(())
 }
 
@@ -177,8 +160,8 @@ fn push_compact_source_label(
     };
     let percent = source
         .percent_used
-        .map(|value| format!("{value}%"))
-        .unwrap_or_else(|| "--%".to_string());
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "--".to_string());
     let estimate = if source.estimated { "~" } else { "" };
     headers.push(prefix.to_string());
     percents.push(format!("{estimate}{percent}"));
@@ -239,7 +222,7 @@ mod tests {
         state.cc.percent_used = Some(73);
         state.cc.reset_at = Some(now + Duration::minutes(75));
         state.cx.enabled = false;
-        assert_eq!(format_tray_label(&state), "CC\n73%");
+        assert_eq!(format_tray_label(&state), "CC\n73");
         assert_eq!(format_tray_tooltip(&state), "CC  73% ↻1h15m");
     }
 
@@ -253,7 +236,7 @@ mod tests {
         let label = format_tray_label(&state);
         let tooltip = format_tray_tooltip(&state);
         assert!(label.contains("CX"));
-        assert!(label.contains("~91%"));
+        assert!(label.contains("~91"));
         assert!(tooltip.contains("CX ~ 91% ↻5m"));
     }
 }
@@ -277,20 +260,4 @@ fn open_or_focus_window<R: tauri::Runtime>(
             .visible(true)
             .build();
     }
-}
-
-fn tray_status_icon() -> Image<'static> {
-    let size = 18u32;
-    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
-    let center = (size as f32 - 1.0) / 2.0;
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            let distance = (dx * dx + dy * dy).sqrt();
-            let alpha = if distance <= 7.0 { 255 } else { 0 };
-            rgba.extend_from_slice(&[0, 0, 0, alpha]);
-        }
-    }
-    Image::new_owned(rgba, size, size)
 }
