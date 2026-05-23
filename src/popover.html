@@ -11,11 +11,43 @@
   </head>
   <body>
     <main>
-      <header>
-        <h1>Usage pattern</h1>
-        <p>Last 24 hours</p>
-      </header>
-      <canvas id="usage-chart" width="520" height="220" aria-label="24 hour usage line graph"></canvas>
+      <section class="limit-card" aria-label="Token limits">
+        <p class="eyebrow">토큰 한도</p>
+        <article class="source-row" data-source="claude_code">
+          <div class="source-heading">
+            <strong>Claude Code</strong>
+            <span><b id="claude-percent">--</b>%</span>
+          </div>
+          <div class="meter" aria-hidden="true"><span id="claude-meter"></span></div>
+          <p class="reset-copy">다음 갱신까지 <span id="claude-reset">--</span></p>
+        </article>
+        <hr />
+        <article class="source-row" data-source="codex">
+          <div class="source-heading">
+            <strong>Codex</strong>
+            <span><b id="codex-percent">--</b>%</span>
+          </div>
+          <div class="meter" aria-hidden="true"><span id="codex-meter"></span></div>
+          <p class="reset-copy">다음 갱신까지 <span id="codex-reset">--</span></p>
+        </article>
+        <hr />
+        <button id="settings-action" class="settings-hint" type="button">
+          <span>설정…</span>
+          <kbd>⌥⌘T</kbd>
+        </button>
+      </section>
+
+      <section class="graph-card" aria-label="Usage pattern">
+        <header>
+          <div>
+            <p class="eyebrow">사용량 그래프</p>
+            <h1>Last 24 hours</h1>
+          </div>
+          <p id="chart-summary">로컬 추정 + API 보정</p>
+        </header>
+        <canvas id="usage-chart" width="520" height="190" aria-label="24 hour usage line graph"></canvas>
+      </section>
+
       <section class="rollups" aria-label="Usage rollups">
         <article><span>Today</span><strong id="rollup-day">--</strong></article>
         <article><span>This week</span><strong id="rollup-week">--</strong></article>

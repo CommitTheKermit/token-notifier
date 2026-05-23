@@ -1,20 +1,30 @@
 :root {
   color-scheme: light dark;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --surface: #ffffff;
+  --ink: #1a1f1a;
+  --muted: rgba(20, 28, 20, 0.55);
+  --hairline: rgba(20, 28, 20, 0.18);
+  --track: rgba(20, 28, 20, 0.08);
+  --fill: #d6e0cd;
+  --fill-strong: #c9d6bf;
+  --shadow: rgba(0, 0, 0, 0.18) 0 20px 60px, rgba(0, 0, 0, 0.18) 0 0 0 0.5px;
 }
 
 body {
   margin: 0;
-  background: Canvas;
-  color: CanvasText;
+  background: transparent;
+  color: var(--ink);
 }
 
 main {
   box-sizing: border-box;
   width: 560px;
-  padding: 18px;
+  padding: 14px;
   display: grid;
-  gap: 16px;
+  gap: 10px;
+  background: var(--surface);
+  color: var(--ink);
 }
 
 header {
@@ -29,20 +39,116 @@ p {
 }
 
 h1 {
-  font-size: 17px;
+  font-size: 16px;
+  letter-spacing: -0.2px;
 }
 
+.eyebrow,
 p,
-.rollups span {
-  color: color-mix(in srgb, CanvasText 65%, transparent);
-  font-size: 12px;
+.rollups span,
+.settings-hint {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.eyebrow {
+  letter-spacing: 0.4px;
+  margin-bottom: 10px;
+}
+
+.limit-card,
+.graph-card,
+.rollups article {
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 16px;
+}
+
+.limit-card {
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.source-row {
+  display: grid;
+  gap: 7px;
+}
+
+.source-heading {
+  align-items: baseline;
+  display: flex;
+  justify-content: space-between;
+}
+
+.source-heading strong,
+.source-heading b {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.source-heading span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.meter {
+  background: var(--track);
+  border-radius: 999px;
+  height: 5px;
+  overflow: hidden;
+}
+
+.meter span {
+  background: linear-gradient(90deg, var(--fill), var(--fill-strong));
+  border-radius: inherit;
+  display: block;
+  height: 100%;
+  transition: width 180ms ease;
+  width: 0%;
+}
+
+.reset-copy {
+  font-size: 11px;
+}
+
+hr {
+  background: var(--hairline);
+  border: 0;
+  height: 1px;
+  margin: 0;
+}
+
+.settings-hint {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  cursor: default;
+  display: flex;
+  justify-content: space-between;
+  padding: 0;
+  text-align: left;
+}
+
+.settings-hint:hover {
+  color: var(--ink);
+}
+
+kbd {
+  font: inherit;
+}
+
+.graph-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
 }
 
 canvas {
   width: 100%;
-  height: 220px;
-  border: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
-  border-radius: 12px;
+  height: 190px;
 }
 
 .rollups {
@@ -52,13 +158,13 @@ canvas {
 }
 
 .rollups article {
-  border: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
-  border-radius: 12px;
-  padding: 12px;
   display: grid;
   gap: 6px;
+  padding: 12px;
 }
 
 .rollups strong {
-  font-size: 18px;
+  color: var(--ink);
+  font-size: 17px;
+  letter-spacing: -0.2px;
 }

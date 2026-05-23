@@ -1,8 +1,9 @@
 const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
 
 const SOURCES = {
-  claude_code: { label: 'CC', color: '#f59e0b' },
-  codex: { label: 'CX', color: '#3b82f6' },
+  claude_code: { label: 'Claude Code', shortLabel: 'CC', color: '#d6e0cd' },
+  codex: { label: 'Codex', shortLabel: 'CX', color: '#9fb391' },
 };
 
 let chart;
@@ -13,6 +14,31 @@ function formatTokens(value) {
 
 function hourLabel(iso) {
   return new Date(iso).toLocaleTimeString([], { hour: '2-digit' });
+}
+
+function formatReset(nowIso, resetIso) {
+  if (!resetIso) return '--';
+  const now = nowIso ? new Date(nowIso) : new Date();
+  const reset = new Date(resetIso);
+  const totalMinutes = Math.max(0, Math.round((reset - now) / 60000));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  const resetTime = reset.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (hours > 0) return `${hours}시간 ${String(minutes).padStart(2, '0')}분 · ${resetTime}`;
+  return `${minutes}분 · ${resetTime}`;
+}
+
+function updateSourceCard(source, state, nowIso) {
+  const prefix = source === 'claude_code' ? 'claude' : 'codex';
+  const percent = state?.percent_used ?? null;
+  document.querySelector(`#${prefix}-percent`).textContent = percent ?? '--';
+  document.querySelector(`#${prefix}-meter`).style.width = `${Math.min(percent ?? 0, 100)}%`;
+  document.querySelector(`#${prefix}-reset`).textContent = formatReset(nowIso, state?.reset_at);
+}
+
+function renderTrayState(state) {
+  updateSourceCard('claude_code', state?.cc, state?.now);
+  updateSourceCard('codex', state?.cx, state?.now);
 }
 
 function toChartData(points) {
@@ -27,8 +53,13 @@ function toChartData(points) {
   return {
     labels: labels.map(hourLabel),
     datasets: Object.entries(SOURCES).map(([source, meta]) => ({
-      label: meta.label,
+      label: meta.shortLabel,
       borderColor: meta.color,
+      backgroundColor: meta.color,
+      borderWidth: 2,
+      pointRadius: 0,
+      pointHitRadius: 8,
+      tension: 0.35,
       data: labels.map((label) => byHour.get(label)?.[source] ?? 0),
     })),
   };
@@ -38,7 +69,31 @@ async function render() {
   const [series, rollups] = await Promise.all([invoke('get_24h_series'), invoke('get_rollups')]);
   const data = toChartData(series);
   if (chart) chart.destroy();
-  chart = new Chart(document.querySelector('#usage-chart'), { type: 'line', data });
+  chart = new Chart(document.querySelector('#usage-chart'), {
+    type: 'line',
+    data,
+    options: {
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          align: 'end',
+          labels: { boxWidth: 8, boxHeight: 8, color: 'rgba(20, 28, 20, 0.55)', usePointStyle: true },
+        },
+      },
+      scales: {
+        x: {
+          grid: { display: false },
+          ticks: { color: 'rgba(20, 28, 20, 0.55)', maxTicksLimit: 6 },
+        },
+        y: {
+          beginAtZero: true,
+          border: { display: false },
+          grid: { color: 'rgba(20, 28, 20, 0.08)' },
+          ticks: { color: 'rgba(20, 28, 20, 0.55)', maxTicksLimit: 4 },
+        },
+      },
+    },
+  });
 
   const total = rollups.reduce(
     (acc, item) => ({
@@ -54,7 +109,15 @@ async function render() {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  render().catch((error) => {
+  document.querySelector('#settings-action').addEventListener('click', () => {
+    invoke('open_settings_window').catch((error) => console.error(error));
+  });
+
+  Promise.all([
+    render(),
+    invoke('get_current_tray_state').then(renderTrayState),
+    listen('usage-update', (event) => renderTrayState(event.payload)),
+  ]).catch((error) => {
     console.error(error);
   });
 });

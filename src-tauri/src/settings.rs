@@ -13,7 +13,18 @@ pub struct SourceSettings {
 pub struct AppSettings {
     pub claude_code: SourceSettings,
     pub codex: SourceSettings,
+    #[serde(default)]
+    pub remote_sync: RemoteSyncSettings,
     pub autostart_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteSyncSettings {
+    pub enabled: bool,
+    pub openai_enabled: bool,
+    pub anthropic_enabled: bool,
+    pub interval_minutes: u64,
+    pub lookback_hours: u64,
 }
 
 impl Default for SourceSettings {
@@ -25,11 +36,24 @@ impl Default for SourceSettings {
     }
 }
 
+impl Default for RemoteSyncSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            openai_enabled: true,
+            anthropic_enabled: true,
+            interval_minutes: 30,
+            lookback_hours: 48,
+        }
+    }
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             claude_code: SourceSettings::default(),
             codex: SourceSettings::default(),
+            remote_sync: RemoteSyncSettings::default(),
             autostart_enabled: false,
         }
     }
@@ -40,6 +64,15 @@ impl AppSettings {
         self.claude_code.thresholds =
             ensure_at_least_one(normalized_thresholds(&self.claude_code.thresholds));
         self.codex.thresholds = ensure_at_least_one(normalized_thresholds(&self.codex.thresholds));
+        self.remote_sync = self.remote_sync.normalized();
+        self
+    }
+}
+
+impl RemoteSyncSettings {
+    pub fn normalized(mut self) -> Self {
+        self.interval_minutes = self.interval_minutes.clamp(5, 24 * 60);
+        self.lookback_hours = self.lookback_hours.clamp(1, 24 * 31);
         self
     }
 }
@@ -92,12 +125,21 @@ mod tests {
                 enabled: false,
                 thresholds: vec![],
             },
+            remote_sync: RemoteSyncSettings {
+                enabled: true,
+                openai_enabled: true,
+                anthropic_enabled: false,
+                interval_minutes: 1,
+                lookback_hours: 24 * 40,
+            },
             autostart_enabled: true,
         }
         .normalized();
 
         assert_eq!(settings.claude_code.thresholds, vec![75, 90, 99]);
         assert_eq!(settings.codex.thresholds, vec![75]);
+        assert_eq!(settings.remote_sync.interval_minutes, 5);
+        assert_eq!(settings.remote_sync.lookback_hours, 24 * 31);
         assert!(settings.autostart_enabled);
     }
 }

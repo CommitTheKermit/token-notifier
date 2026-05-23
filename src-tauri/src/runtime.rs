@@ -3,6 +3,7 @@ use crate::config::{database_path, HiddenConfig};
 use crate::parser::claude_code::ClaudeCodeParser;
 use crate::parser::codex::CodexParser;
 use crate::parser::UsageSource;
+use crate::remote_sync;
 use crate::scheduler::{UsageScheduler, MIN_POLL_INTERVAL_SECS};
 use crate::settings::{load_settings, SourceSettings};
 use crate::storage::UsageStore;
@@ -58,7 +59,28 @@ pub fn start_background_runtime<R: tauri::Runtime>(app: AppHandle<R>) -> anyhow:
         }
     });
 
+    start_remote_sync_runtime();
+
     Ok(())
+}
+
+fn start_remote_sync_runtime() {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let settings = load_settings().remote_sync;
+            if settings.enabled {
+                if let Some(db_path) = database_path() {
+                    let now = Utc::now();
+                    if let Err(error) = remote_sync::sync_once(db_path, &settings, now).await {
+                        eprintln!("token-notifier remote sync failed: {error:#}");
+                    }
+                }
+                time::sleep(Duration::from_secs(settings.interval_minutes * 60)).await;
+            } else {
+                time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    });
 }
 
 fn handle_outcome<R: tauri::Runtime>(

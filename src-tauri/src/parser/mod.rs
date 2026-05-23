@@ -6,7 +6,7 @@ pub mod claude_code;
 pub mod codex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum UsageSource {
     ClaudeCode,
     Codex,
@@ -86,6 +86,18 @@ mod tests {
     use super::{LocalLogParser, UsageSource};
     use std::fs::OpenOptions;
     use std::io::Write;
+
+    #[test]
+    fn serializes_sources_for_frontend_keys() {
+        assert_eq!(
+            serde_json::to_value(UsageSource::ClaudeCode).unwrap(),
+            serde_json::json!("claude_code")
+        );
+        assert_eq!(
+            serde_json::to_value(UsageSource::Codex).unwrap(),
+            serde_json::json!("codex")
+        );
+    }
 
     #[test]
     fn reads_incremental_with_offset() {

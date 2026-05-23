@@ -3,6 +3,7 @@ pub mod autostart;
 pub mod config;
 pub mod native_status;
 pub mod parser;
+pub mod remote_sync;
 pub mod runtime;
 pub mod scheduler;
 pub mod settings;
@@ -31,6 +32,21 @@ fn get_rollups() -> Result<Vec<storage::Rollups>, String> {
     store
         .get_rollups(Utc::now())
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_remote_sync_states() -> Result<Vec<storage::RemoteSyncState>, String> {
+    let path = config::database_path()
+        .ok_or_else(|| "Could not resolve application data directory".to_string())?;
+    let store = storage::UsageStore::open(path).map_err(|error| error.to_string())?;
+    store
+        .get_remote_sync_states()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_current_tray_state() -> tray::TrayDisplayState {
+    tray::latest_display_state()
 }
 
 #[tauri::command]
@@ -64,16 +80,24 @@ fn open_login_items_settings() {
     autostart::open_login_items_settings();
 }
 
+#[tauri::command]
+fn open_settings_window<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
+    tray::open_settings_window(&app);
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             get_24h_series,
             get_rollups,
+            get_remote_sync_states,
+            get_current_tray_state,
             get_settings,
             save_settings,
             get_autostart_status,
-            open_login_items_settings
+            open_login_items_settings,
+            open_settings_window
         ])
         // Autostart intentionally uses the SMAppService wrapper in autostart.rs.
         // tauri-plugin-autostart remains available but is not initialized in its

@@ -1,7 +1,7 @@
 use crate::parser::{UsageEvent, UsageSource};
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -17,6 +17,22 @@ pub struct Rollups {
     pub day_tokens: u64,
     pub week_tokens: u64,
     pub month_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteHourlyPoint {
+    pub provider: String,
+    pub source: UsageSource,
+    pub hour_start: DateTime<Utc>,
+    pub tokens_used: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteSyncState {
+    pub provider: String,
+    pub last_synced_at: DateTime<Utc>,
+    pub status: String,
+    pub message: Option<String>,
 }
 
 pub struct UsageStore {
@@ -65,6 +81,20 @@ impl UsageStore {
                 notified_at INTEGER NOT NULL,
                 PRIMARY KEY (source, window_id, threshold)
             );
+            CREATE TABLE IF NOT EXISTS remote_hourly_bucket (
+                provider TEXT NOT NULL,
+                source TEXT NOT NULL,
+                hour_start INTEGER NOT NULL,
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                synced_at INTEGER NOT NULL,
+                PRIMARY KEY (provider, source, hour_start)
+            );
+            CREATE TABLE IF NOT EXISTS remote_sync_state (
+                provider TEXT PRIMARY KEY,
+                last_synced_at INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                message TEXT
+            );
             ",
         )?;
         Ok(())
@@ -93,8 +123,22 @@ impl UsageStore {
     pub fn get_24h_series(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<HourlyPoint>> {
         let start = truncate_to_hour(now - Duration::hours(23));
         let mut stmt = self.conn.prepare(
-            "SELECT source, hour_start, tokens_used FROM hourly_bucket
-             WHERE hour_start >= ?1 ORDER BY hour_start ASC, source ASC",
+            "WITH remote AS (
+                SELECT source, hour_start, SUM(tokens_used) AS tokens_used
+                FROM remote_hourly_bucket
+                WHERE hour_start >= ?1
+                GROUP BY source, hour_start
+             ),
+             merged_keys AS (
+                SELECT source, hour_start FROM hourly_bucket WHERE hour_start >= ?1
+                UNION
+                SELECT source, hour_start FROM remote
+             )
+             SELECT k.source, k.hour_start, COALESCE(r.tokens_used, l.tokens_used, 0)
+             FROM merged_keys k
+             LEFT JOIN hourly_bucket l ON l.source = k.source AND l.hour_start = k.hour_start
+             LEFT JOIN remote r ON r.source = k.source AND r.hour_start = k.hour_start
+             ORDER BY k.hour_start ASC, k.source ASC",
         )?;
         let rows = stmt.query_map(params![start.timestamp()], |row| {
             let source: String = row.get(0)?;
@@ -128,10 +172,75 @@ impl UsageStore {
             .timestamp();
         Ok(Rollups {
             source,
-            day_tokens: self.sum_rollup(source, day)?,
-            week_tokens: self.sum_rollup(source, week)?,
-            month_tokens: self.sum_rollup(source, month)?,
+            day_tokens: self.sum_merged_hourly(source, day)?,
+            week_tokens: self.sum_merged_hourly(source, week)?,
+            month_tokens: self.sum_merged_hourly(source, month)?,
         })
+    }
+
+    pub fn upsert_remote_hourly_points(
+        &mut self,
+        provider: &str,
+        points: &[RemoteHourlyPoint],
+        synced_at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        for point in points {
+            tx.execute(
+                "INSERT INTO remote_hourly_bucket (provider, source, hour_start, tokens_used, synced_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(provider, source, hour_start) DO UPDATE SET
+                    tokens_used = excluded.tokens_used,
+                    synced_at = excluded.synced_at",
+                params![
+                    provider,
+                    point.source.as_str(),
+                    truncate_to_hour(point.hour_start).timestamp(),
+                    point.tokens_used as i64,
+                    synced_at.timestamp()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_remote_sync_state(
+        &self,
+        provider: &str,
+        status: &str,
+        message: Option<&str>,
+        synced_at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO remote_sync_state (provider, last_synced_at, status, message)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(provider) DO UPDATE SET
+                last_synced_at = excluded.last_synced_at,
+                status = excluded.status,
+                message = excluded.message",
+            params![provider, synced_at.timestamp(), status, message],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_remote_sync_states(&self) -> anyhow::Result<Vec<RemoteSyncState>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT provider, last_synced_at, status, message
+             FROM remote_sync_state
+             ORDER BY provider ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let provider: String = row.get(0)?;
+            let ts: i64 = row.get(1)?;
+            Ok(RemoteSyncState {
+                provider,
+                last_synced_at: Utc.timestamp_opt(ts, 0).single().unwrap_or_else(Utc::now),
+                status: row.get(2)?,
+                message: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn mark_threshold_notified(
@@ -179,12 +288,26 @@ impl UsageStore {
         Ok(existing.is_some())
     }
 
-    fn sum_rollup(&self, source: UsageSource, start_day: i64) -> anyhow::Result<u64> {
+    fn sum_merged_hourly(&self, source: UsageSource, start_hour: i64) -> anyhow::Result<u64> {
         let value: Option<u64> = self
             .conn
             .query_row(
-                "SELECT COALESCE(SUM(tokens_used), 0) FROM daily_rollup WHERE source = ?1 AND day_start >= ?2",
-                params![source.as_str(), start_day],
+                "WITH remote AS (
+                    SELECT source, hour_start, SUM(tokens_used) AS tokens_used
+                    FROM remote_hourly_bucket
+                    WHERE source = ?1 AND hour_start >= ?2
+                    GROUP BY source, hour_start
+                 ),
+                 merged_keys AS (
+                    SELECT source, hour_start FROM hourly_bucket WHERE source = ?1 AND hour_start >= ?2
+                    UNION
+                    SELECT source, hour_start FROM remote
+                 )
+                 SELECT COALESCE(SUM(COALESCE(r.tokens_used, l.tokens_used, 0)), 0)
+                 FROM merged_keys k
+                 LEFT JOIN hourly_bucket l ON l.source = k.source AND l.hour_start = k.hour_start
+                 LEFT JOIN remote r ON r.source = k.source AND r.hour_start = k.hour_start",
+                params![source.as_str(), start_hour],
                 |row| row.get(0),
             )
             .optional()?;
@@ -240,5 +363,33 @@ mod tests {
         assert_eq!(rollup.day_tokens, 150);
         assert_eq!(rollup.week_tokens, 150);
         assert_eq!(rollup.month_tokens, 150);
+    }
+
+    #[test]
+    fn remote_hourly_points_override_local_hourly_when_present() {
+        let mut store = UsageStore::in_memory().expect("store");
+        let at = Utc.with_ymd_and_hms(2026, 5, 21, 10, 15, 0).unwrap();
+        store
+            .record_usage_event(&usage_event(UsageSource::Codex, at, 100))
+            .unwrap();
+        store
+            .upsert_remote_hourly_points(
+                "openai",
+                &[RemoteHourlyPoint {
+                    provider: "openai".to_string(),
+                    source: UsageSource::Codex,
+                    hour_start: at,
+                    tokens_used: 175,
+                }],
+                at,
+            )
+            .unwrap();
+
+        let series = store.get_24h_series(at).unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].tokens_used, 175);
+
+        let rollup = store.rollups_for(UsageSource::Codex, at).unwrap();
+        assert_eq!(rollup.day_tokens, 175);
     }
 }

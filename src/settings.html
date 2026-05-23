@@ -27,6 +27,16 @@
           <legend>Startup</legend>
           <label><input id="autostart-enabled" type="checkbox" /> Start at login</label>
         </fieldset>
+        <fieldset>
+          <legend>Remote API correction</legend>
+          <label><input id="remote-enabled" type="checkbox" /> Periodically correct historical usage from provider APIs</label>
+          <label><input id="openai-enabled" type="checkbox" /> OpenAI Usage API → Codex</label>
+          <label><input id="anthropic-enabled" type="checkbox" /> Anthropic Usage API → Claude Code</label>
+          <label>Sync interval minutes <input id="sync-interval" type="number" min="5" max="1440" step="5" /></label>
+          <label>Lookback hours <input id="sync-lookback" type="number" min="1" max="744" step="1" /></label>
+          <p>Uses OPENAI_ADMIN_KEY and ANTHROPIC_ADMIN_KEY from the app environment. Synced API buckets override matching local hourly estimates.</p>
+          <output id="remote-status" role="status"></output>
+        </fieldset>
         <button type="submit">Save</button>
         <output id="status" role="status"></output>
       </form>

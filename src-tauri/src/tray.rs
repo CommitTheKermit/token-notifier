@@ -11,6 +11,7 @@ use tauri::{
 use crate::native_status::NativeStatusClick;
 
 static LAST_POPOVER_AUTO_HIDE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+static LAST_DISPLAY_STATE: OnceLock<Mutex<TrayDisplayState>> = OnceLock::new();
 const POPOVER_AUTO_HIDE_DEBOUNCE: StdDuration = StdDuration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,14 +82,14 @@ pub fn color_for_percent(percent: u8) -> PercentColor {
 }
 
 pub fn format_tray_label(state: &TrayDisplayState) -> String {
-    let mut headers = Vec::new();
     let mut percents = Vec::new();
-    push_compact_source_label(&mut headers, &mut percents, &state.cc);
-    push_compact_source_label(&mut headers, &mut percents, &state.cx);
-    if headers.is_empty() {
+    let mut reset_hours = Vec::new();
+    push_grid_source_label(&mut percents, &mut reset_hours, &state.cc, state.now);
+    push_grid_source_label(&mut percents, &mut reset_hours, &state.cx, state.now);
+    if percents.is_empty() {
         "Token Notifier".to_string()
     } else {
-        format!("{}\n{}", headers.join("   "), percents.join("  "))
+        format!("{}\n{}", percents.join(" "), reset_hours.join(" "))
     }
 }
 
@@ -105,6 +106,7 @@ pub fn format_tray_tooltip(state: &TrayDisplayState) -> String {
 
 pub fn build_main_tray(app: &App) -> tauri::Result<()> {
     let initial_state = TrayDisplayState::empty(Utc::now());
+    store_latest_display_state(&initial_state);
     let initial_title = format_tray_label(&initial_state);
     let initial_tooltip = format_tray_tooltip(&initial_state);
     let (click_sender, click_receiver) = std::sync::mpsc::channel();
@@ -126,7 +128,7 @@ pub fn build_main_tray(app: &App) -> tauri::Result<()> {
                     "popover.html",
                     "Token Notifier",
                     560.0,
-                    380.0,
+                    560.0,
                     true,
                 ),
                 NativeStatusClick::OpenSettings => open_or_focus_window(
@@ -148,32 +150,61 @@ pub fn update_main_tray<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &TrayDisplayState,
 ) -> tauri::Result<()> {
+    store_latest_display_state(state);
     let title = format_tray_label(state);
     let tooltip = format_tray_tooltip(state);
     crate::native_status::update_title(app, title, tooltip);
     Ok(())
 }
 
-fn push_compact_source_label(
-    headers: &mut Vec<String>,
+pub fn latest_display_state() -> TrayDisplayState {
+    LAST_DISPLAY_STATE
+        .get()
+        .and_then(|state| state.lock().ok().map(|state| state.clone()))
+        .unwrap_or_else(|| TrayDisplayState::empty(Utc::now()))
+}
+
+pub fn open_settings_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    open_or_focus_window(
+        app,
+        "settings",
+        "settings.html",
+        "Token Notifier Settings",
+        460.0,
+        520.0,
+        false,
+    );
+}
+
+fn store_latest_display_state(state: &TrayDisplayState) {
+    let latest = LAST_DISPLAY_STATE.get_or_init(|| Mutex::new(TrayDisplayState::empty(Utc::now())));
+    if let Ok(mut latest) = latest.lock() {
+        *latest = state.clone();
+    }
+}
+
+fn push_grid_source_label(
     percents: &mut Vec<String>,
+    reset_hours: &mut Vec<String>,
     source: &SourceTrayState,
+    now: DateTime<Utc>,
 ) {
     if !source.enabled {
         return;
     }
 
-    let prefix = match source.source {
-        UsageSource::ClaudeCode => "CC",
-        UsageSource::Codex => "CX",
-    };
     let percent = source
         .percent_used
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "--".to_string());
+        .map(|value| format!("{value}%"))
+        .unwrap_or_else(|| "--%".to_string());
     let estimate = if source.estimated { "~" } else { "" };
-    headers.push(prefix.to_string());
-    percents.push(format!("{estimate}{percent}"));
+    percents.push(fixed_grid_cell(&format!("{estimate}{percent}")));
+    reset_hours.push(fixed_grid_cell(
+        &source
+            .reset_at
+            .map(|reset_at| format_reset_hours(now, reset_at))
+            .unwrap_or_else(|| "--h".to_string()),
+    ));
 }
 
 fn push_source_label(parts: &mut Vec<String>, source: &SourceTrayState, now: DateTime<Utc>) {
@@ -195,6 +226,19 @@ fn push_source_label(parts: &mut Vec<String>, source: &SourceTrayState, now: Dat
         .map(|reset_at| format!("↻{}", format_countdown(now, reset_at)))
         .unwrap_or_else(|| "↻--".to_string());
     parts.push(format!("{prefix} {estimate}{percent} {reset}"));
+}
+
+fn fixed_grid_cell(value: &str) -> String {
+    format!("{value:>6}")
+}
+
+fn format_reset_hours(now: DateTime<Utc>, reset_at: DateTime<Utc>) -> String {
+    if reset_at <= now {
+        return "0.0h".to_string();
+    }
+    let total_minutes = (reset_at - now).num_minutes().max(0);
+    let hours = total_minutes as f64 / 60.0;
+    format!("{hours:.1}h")
 }
 
 fn format_countdown(now: DateTime<Utc>, reset_at: DateTime<Utc>) -> String {
@@ -225,14 +269,42 @@ mod tests {
     }
 
     #[test]
+    fn format_tray_label_uses_percent_over_reset_hour_grid() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 5, 0, 0).unwrap();
+        let mut state = TrayDisplayState::empty(now);
+        state.cc.percent_used = Some(47);
+        state.cc.reset_at = Some(now + Duration::hours(3));
+        state.cx.percent_used = Some(82);
+        state.cx.reset_at = Some(now + Duration::hours(1));
+
+        assert_eq!(format_tray_label(&state), "   47%    82%\n  3.0h   1.0h");
+    }
+
+    #[test]
     fn format_tray_label_handles_disabled_sources() {
         let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
         let mut state = TrayDisplayState::empty(now);
         state.cc.percent_used = Some(73);
         state.cc.reset_at = Some(now + Duration::minutes(75));
         state.cx.enabled = false;
-        assert_eq!(format_tray_label(&state), "CC\n73");
+        assert_eq!(format_tray_label(&state), "   73%\n  1.2h");
         assert_eq!(format_tray_tooltip(&state), "CC  73% ↻1h15m");
+    }
+
+    #[test]
+    fn format_tray_label_keeps_constant_grid_width_across_digit_counts() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 5, 0, 0).unwrap();
+        let mut state = TrayDisplayState::empty(now);
+        state.cc.percent_used = Some(1);
+        state.cc.reset_at = Some(now + Duration::hours(1));
+        state.cx.percent_used = Some(100);
+        state.cx.reset_at = Some(now + Duration::hours(100));
+
+        let label = format_tray_label(&state);
+        let lines = label.lines().collect::<Vec<_>>();
+        assert_eq!(lines, ["    1%   100%", "  1.0h 100.0h"]);
+        assert_eq!(lines[0].chars().count(), lines[1].chars().count());
+        assert_eq!(lines[0].chars().count(), 13);
     }
 
     #[test]
@@ -244,8 +316,8 @@ mod tests {
         state.cx.estimated = true;
         let label = format_tray_label(&state);
         let tooltip = format_tray_tooltip(&state);
-        assert!(label.contains("CX"));
-        assert!(label.contains("~91"));
+        assert!(label.contains("~91%"));
+        assert!(label.contains("0.1h"));
         assert!(tooltip.contains("CX ~ 91% ↻5m"));
     }
 }
