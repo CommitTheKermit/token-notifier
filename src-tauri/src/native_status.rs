@@ -1,9 +1,11 @@
 #[cfg(target_os = "macos")]
 mod macos {
     use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSStatusBar, NSStatusItem, NSVariableStatusItemLength};
+    use objc2_app_kit::{NSFont, NSStatusBar, NSStatusItem, NSVariableStatusItemLength};
     use objc2_foundation::NSString;
     use std::cell::RefCell;
+
+    const STATUS_FONT_SIZE: f64 = 8.0;
 
     thread_local! {
         static STATUS_ITEM: RefCell<Option<objc2::rc::Retained<NSStatusItem>>> = const { RefCell::new(None) };
@@ -19,16 +21,10 @@ mod macos {
                 let status_bar = NSStatusBar::systemStatusBar();
                 let item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
                 item.setVisible(true);
-                if let Some(button) = item.button(mtm) {
-                    let title = NSString::from_str(initial_title);
-                    button.setTitle(&title);
-                }
+                set_status_title(&item, mtm, initial_title);
                 *cell.borrow_mut() = Some(item);
             } else if let Some(item) = cell.borrow().as_ref() {
-                if let Some(button) = item.button(mtm) {
-                    let title = NSString::from_str(initial_title);
-                    button.setTitle(&title);
-                }
+                set_status_title(item, mtm, initial_title);
             }
         });
     }
@@ -45,12 +41,17 @@ mod macos {
             }
             if let Some(item) = cell.borrow().as_ref() {
                 item.setVisible(true);
-                if let Some(button) = item.button(mtm) {
-                    let title = NSString::from_str(title);
-                    button.setTitle(&title);
-                }
+                set_status_title(item, mtm, title);
             }
         });
+    }
+
+    fn set_status_title(item: &NSStatusItem, mtm: MainThreadMarker, title: &str) {
+        if let Some(button) = item.button(mtm) {
+            let font = NSFont::menuBarFontOfSize(STATUS_FONT_SIZE);
+            button.setFont(Some(&font));
+            button.setTitle(&NSString::from_str(title));
+        }
     }
 }
 

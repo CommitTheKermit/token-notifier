@@ -107,7 +107,6 @@ pub fn build_main_tray(app: &App) -> tauri::Result<TrayIcon> {
     TrayIconBuilder::with_id(MAIN_TRAY_ID)
         .icon(icon)
         .icon_as_template(true)
-        .title(initial_title)
         .tooltip(initial_tooltip)
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
@@ -158,7 +157,6 @@ pub fn update_main_tray<R: tauri::Runtime>(
     let tooltip = format_tray_tooltip(state);
     crate::native_status::update_title(app, title.clone());
     if let Some(tray) = app.tray_by_id(MAIN_TRAY_ID) {
-        tray.set_title(Some(title))?;
         tray.set_tooltip(Some(tooltip))?;
     }
     Ok(())
