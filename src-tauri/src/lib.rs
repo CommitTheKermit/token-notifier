@@ -86,7 +86,7 @@ fn open_settings_window<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             get_24h_series,
@@ -110,6 +110,38 @@ pub fn run() {
                 .map_err(|error| tauri::Error::Anyhow(error.into()))?;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Token Notifier");
+        .build(tauri::generate_context!())
+        .expect("error while building Token Notifier");
+
+    app.run(|_app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+            if should_keep_menu_bar_app_alive(code) {
+                api.prevent_exit();
+            }
+        }
+    });
+}
+
+fn should_keep_menu_bar_app_alive(exit_code: Option<i32>) -> bool {
+    // With the status item now owned by AppKit instead of Tauri's tray plugin,
+    // macOS/Tauri may request a normal implicit exit when there are no WebView
+    // windows. A menu-bar app must ignore that request, while explicit app
+    // exits/restarts keep their non-None code and are allowed through.
+    exit_code.is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_bar_app_prevents_implicit_exit_requests() {
+        assert!(should_keep_menu_bar_app_alive(None));
+    }
+
+    #[test]
+    fn menu_bar_app_allows_explicit_exit_requests() {
+        assert!(!should_keep_menu_bar_app_alive(Some(0)));
+        assert!(!should_keep_menu_bar_app_alive(Some(130)));
+    }
 }
