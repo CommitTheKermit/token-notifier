@@ -1,8 +1,8 @@
 :root {
   color-scheme: dark;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
-  --panel: rgba(72, 73, 72, 0.78);
-  --panel-top: rgba(86, 88, 86, 0.78);
+  --panel-tint: rgba(46, 47, 46, 0.22);
+  --panel-tint-top: rgba(96, 98, 96, 0.24);
   --section: rgba(255, 255, 255, 0.055);
   --section-hover: rgba(255, 255, 255, 0.105);
   --ink: rgba(255, 255, 255, 0.88);
@@ -18,7 +18,6 @@
   --chart-codex: #a7ba98;
   --danger: #ff6b6b;
   --warning: #ffd166;
-  --shadow: 0 24px 70px rgba(0, 0, 0, 0.36), 0 2px 10px rgba(0, 0, 0, 0.28);
 }
 
 * {
@@ -47,13 +46,10 @@ main {
   overflow: hidden;
   color: var(--ink);
   background:
-    radial-gradient(circle at 42% 0%, rgba(177, 184, 129, 0.16), transparent 28%),
-    linear-gradient(180deg, var(--panel-top), var(--panel));
+    radial-gradient(circle at 42% 0%, rgba(177, 184, 129, 0.1), transparent 28%),
+    linear-gradient(180deg, var(--panel-tint-top), var(--panel-tint));
   border: 1px solid var(--hairline-strong);
   border-radius: 22px;
-  box-shadow: var(--shadow);
-  backdrop-filter: blur(34px) saturate(1.6);
-  -webkit-backdrop-filter: blur(34px) saturate(1.6);
 }
 
 header {
@@ -265,8 +261,8 @@ canvas {
 @media (prefers-color-scheme: light) {
   :root {
     color-scheme: light;
-    --panel: rgba(236, 239, 232, 0.76);
-    --panel-top: rgba(248, 250, 245, 0.82);
+    --panel-tint: rgba(248, 250, 245, 0.28);
+    --panel-tint-top: rgba(255, 255, 255, 0.36);
     --section: rgba(255, 255, 255, 0.5);
     --section-hover: rgba(255, 255, 255, 0.74);
     --ink: rgba(20, 24, 21, 0.78);
@@ -276,7 +272,6 @@ canvas {
     --hairline: rgba(20, 24, 21, 0.12);
     --hairline-strong: rgba(20, 24, 21, 0.18);
     --track: rgba(20, 24, 21, 0.1);
-    --shadow: 0 24px 70px rgba(0, 0, 0, 0.2), 0 2px 10px rgba(0, 0, 0, 0.13);
   }
 
   .source-row::before {

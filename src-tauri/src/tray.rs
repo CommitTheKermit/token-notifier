@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 use tauri::{
+    window::{Effect, EffectState, EffectsBuilder},
     App, LogicalPosition, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 
@@ -342,6 +343,7 @@ fn open_or_focus_window<R: tauri::Runtime>(
             }
         }
         if anchor_to_status {
+            let _ = window.set_effects(popover_window_effects());
             position_window_below_status(app, &window, width, height);
         }
         let _ = window.show();
@@ -356,6 +358,7 @@ fn open_or_focus_window<R: tauri::Runtime>(
             builder = builder
                 .decorations(false)
                 .transparent(true)
+                .effects(popover_window_effects())
                 .always_on_top(true)
                 .skip_taskbar(true)
                 .shadow(true);
@@ -369,6 +372,14 @@ fn open_or_focus_window<R: tauri::Runtime>(
             }
         }
     }
+}
+
+fn popover_window_effects() -> tauri::utils::config::WindowEffectsConfig {
+    EffectsBuilder::new()
+        .effect(Effect::Popover)
+        .state(EffectState::Active)
+        .radius(22.0)
+        .build()
 }
 
 fn attach_popover_autohide<R: tauri::Runtime>(window: &WebviewWindow<R>) {
