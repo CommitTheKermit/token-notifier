@@ -127,8 +127,8 @@ pub fn build_main_tray(app: &App) -> tauri::Result<()> {
                     "popover",
                     "popover.html",
                     "Token Notifier",
-                    560.0,
-                    560.0,
+                    486.0,
+                    582.0,
                     true,
                 ),
                 NativeStatusClick::OpenSettings => open_or_focus_window(
@@ -355,6 +355,7 @@ fn open_or_focus_window<R: tauri::Runtime>(
         if anchor_to_status {
             builder = builder
                 .decorations(false)
+                .transparent(true)
                 .always_on_top(true)
                 .skip_taskbar(true)
                 .shadow(true);

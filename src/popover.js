@@ -2,9 +2,13 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const SOURCES = {
-  claude_code: { label: 'Claude Code', shortLabel: 'CC', color: '#d6e0cd' },
-  codex: { label: 'Codex', shortLabel: 'CX', color: '#9fb391' },
+  claude_code: { label: 'Claude Code', shortLabel: 'CC', cssColor: '--chart-claude' },
+  codex: { label: 'Codex', shortLabel: 'CX', cssColor: '--chart-codex' },
 };
+
+function cssVar(name, fallback) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+}
 
 let chart;
 
@@ -54,8 +58,8 @@ function toChartData(points) {
     labels: labels.map(hourLabel),
     datasets: Object.entries(SOURCES).map(([source, meta]) => ({
       label: meta.shortLabel,
-      borderColor: meta.color,
-      backgroundColor: meta.color,
+      borderColor: cssVar(meta.cssColor, '#d6e0cd'),
+      backgroundColor: cssVar(meta.cssColor, '#d6e0cd'),
       borderWidth: 2,
       pointRadius: 0,
       pointHitRadius: 8,
@@ -77,19 +81,24 @@ async function render() {
       plugins: {
         legend: {
           align: 'end',
-          labels: { boxWidth: 8, boxHeight: 8, color: 'rgba(20, 28, 20, 0.55)', usePointStyle: true },
+          labels: {
+            boxWidth: 8,
+            boxHeight: 8,
+            color: cssVar('--muted-strong', 'rgba(255, 255, 255, 0.62)'),
+            usePointStyle: true,
+          },
         },
       },
       scales: {
         x: {
           grid: { display: false },
-          ticks: { color: 'rgba(20, 28, 20, 0.55)', maxTicksLimit: 6 },
+          ticks: { color: cssVar('--muted', 'rgba(255, 255, 255, 0.47)'), maxTicksLimit: 6 },
         },
         y: {
           beginAtZero: true,
           border: { display: false },
-          grid: { color: 'rgba(20, 28, 20, 0.08)' },
-          ticks: { color: 'rgba(20, 28, 20, 0.55)', maxTicksLimit: 4 },
+          grid: { color: cssVar('--hairline', 'rgba(255, 255, 255, 0.145)') },
+          ticks: { color: cssVar('--muted', 'rgba(255, 255, 255, 0.47)'), maxTicksLimit: 4 },
         },
       },
     },
