@@ -2,9 +2,16 @@ use crate::parser::UsageSource;
 use crate::window_estimator::UsageSnapshot;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tauri::{App, LogicalPosition, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration as StdDuration, Instant};
+use tauri::{
+    App, LogicalPosition, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+};
 
 use crate::native_status::NativeStatusClick;
+
+static LAST_POPOVER_AUTO_HIDE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+const POPOVER_AUTO_HIDE_DEBOUNCE: StdDuration = StdDuration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PercentColor {
@@ -254,6 +261,15 @@ fn open_or_focus_window<R: tauri::Runtime>(
 ) {
     if let Some(window) = app.get_webview_window(label) {
         if anchor_to_status {
+            if window.is_visible().unwrap_or(false) {
+                let _ = window.hide();
+                return;
+            }
+            if popover_was_just_auto_hidden() {
+                return;
+            }
+        }
+        if anchor_to_status {
             position_window_below_status(app, &window, width, height);
         }
         let _ = window.show();
@@ -273,12 +289,39 @@ fn open_or_focus_window<R: tauri::Runtime>(
         }
         if let Ok(window) = builder.build() {
             if anchor_to_status {
+                attach_popover_autohide(&window);
                 position_window_below_status(app, &window, width, height);
                 let _ = window.show();
                 let _ = window.set_focus();
             }
         }
     }
+}
+
+fn attach_popover_autohide<R: tauri::Runtime>(window: &WebviewWindow<R>) {
+    let popover = window.clone();
+    window.on_window_event(move |event| {
+        if matches!(event, WindowEvent::Focused(false)) && popover.is_visible().unwrap_or(false) {
+            let _ = popover.hide();
+            record_popover_auto_hide();
+        }
+    });
+}
+
+fn record_popover_auto_hide() {
+    let state = LAST_POPOVER_AUTO_HIDE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut last_hide) = state.lock() {
+        *last_hide = Some(Instant::now());
+    }
+}
+
+fn popover_was_just_auto_hidden() -> bool {
+    let state = LAST_POPOVER_AUTO_HIDE.get_or_init(|| Mutex::new(None));
+    state
+        .lock()
+        .ok()
+        .and_then(|last_hide| *last_hide)
+        .is_some_and(|last_hide| last_hide.elapsed() < POPOVER_AUTO_HIDE_DEBOUNCE)
 }
 
 fn position_window_below_status<R: tauri::Runtime>(
