@@ -3,17 +3,11 @@ use crate::window_estimator::UsageSnapshot;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration as StdDuration, Instant};
-use tauri::{
-    window::{Effect, EffectState, EffectsBuilder},
-    App, LogicalPosition, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
-};
+use tauri::{App, Manager, WebviewUrl, WebviewWindowBuilder};
 
-use crate::native_status::NativeStatusClick;
+use crate::native_status::{NativePopoverSourceState, NativePopoverState, NativeStatusClick};
 
-static LAST_POPOVER_AUTO_HIDE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 static LAST_DISPLAY_STATE: OnceLock<Mutex<TrayDisplayState>> = OnceLock::new();
-const POPOVER_AUTO_HIDE_DEBOUNCE: StdDuration = StdDuration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PercentColor {
@@ -123,15 +117,9 @@ pub fn build_main_tray(app: &App) -> tauri::Result<()> {
             let app = app_handle.clone();
             let window_app = app.clone();
             let _ = app.run_on_main_thread(move || match click {
-                NativeStatusClick::OpenPopover => open_or_focus_window(
-                    &window_app,
-                    "popover",
-                    "popover.html",
-                    "Token Notifier",
-                    486.0,
-                    582.0,
-                    true,
-                ),
+                NativeStatusClick::OpenPopover => {
+                    crate::native_status::toggle_popover(native_popover_state())
+                }
                 NativeStatusClick::OpenSettings => open_or_focus_window(
                     &window_app,
                     "settings",
@@ -139,7 +127,6 @@ pub fn build_main_tray(app: &App) -> tauri::Result<()> {
                     "Token Notifier Settings",
                     460.0,
                     520.0,
-                    false,
                 ),
             });
         }
@@ -155,6 +142,7 @@ pub fn update_main_tray<R: tauri::Runtime>(
     let title = format_tray_label(state);
     let tooltip = format_tray_tooltip(state);
     crate::native_status::update_title(app, title, tooltip);
+    crate::native_status::update_popover(app, native_popover_state_from_tray_state(state));
     Ok(())
 }
 
@@ -173,7 +161,6 @@ pub fn open_settings_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         "Token Notifier Settings",
         460.0,
         520.0,
-        false,
     );
 }
 
@@ -182,6 +169,85 @@ fn store_latest_display_state(state: &TrayDisplayState) {
     if let Ok(mut latest) = latest.lock() {
         *latest = state.clone();
     }
+}
+
+fn native_popover_state() -> NativePopoverState {
+    native_popover_state_from_tray_state(&latest_display_state())
+}
+
+fn native_popover_state_from_tray_state(state: &TrayDisplayState) -> NativePopoverState {
+    let (rollup_day, rollup_week, rollup_month) = rollup_totals()
+        .map(|(day, week, month)| {
+            (
+                format_tokens(day),
+                format_tokens(week),
+                format_tokens(month),
+            )
+        })
+        .unwrap_or_else(|| ("--".to_string(), "--".to_string(), "--".to_string()));
+
+    NativePopoverState {
+        sources: [&state.cc, &state.cx]
+            .into_iter()
+            .filter(|source| source.enabled)
+            .map(|source| native_popover_source(source, state.now))
+            .collect(),
+        rollup_day,
+        rollup_week,
+        rollup_month,
+        updated_text: format!(
+            "업데이트 {}",
+            state.now.with_timezone(&chrono::Local).format("%H:%M")
+        ),
+    }
+}
+
+fn native_popover_source(source: &SourceTrayState, now: DateTime<Utc>) -> NativePopoverSourceState {
+    let label = match source.source {
+        UsageSource::ClaudeCode => "Claude Code",
+        UsageSource::Codex => "Codex",
+    };
+    let percent = source.percent_used.unwrap_or(0);
+    let percent_text = source
+        .percent_used
+        .map(|value| format!("{value}%"))
+        .unwrap_or_else(|| "--%".to_string());
+    let reset_text = source
+        .reset_at
+        .map(|reset_at| format!("다음 갱신까지 {}", format_countdown(now, reset_at)))
+        .unwrap_or_else(|| "다음 갱신까지 --".to_string());
+
+    NativePopoverSourceState {
+        label: label.to_string(),
+        percent_text,
+        reset_text,
+        fraction: f64::from(percent) / 100.0,
+    }
+}
+
+fn rollup_totals() -> Option<(u64, u64, u64)> {
+    let path = crate::config::database_path()?;
+    let store = crate::storage::UsageStore::open(path).ok()?;
+    let rollups = store.get_rollups(Utc::now()).ok()?;
+    Some(rollups.into_iter().fold((0, 0, 0), |acc, item| {
+        (
+            acc.0 + item.day_tokens,
+            acc.1 + item.week_tokens,
+            acc.2 + item.month_tokens,
+        )
+    }))
+}
+
+fn format_tokens(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect::<String>()
 }
 
 fn push_grid_source_label(
@@ -330,118 +396,18 @@ fn open_or_focus_window<R: tauri::Runtime>(
     title: &str,
     width: f64,
     height: f64,
-    anchor_to_status: bool,
 ) {
     if let Some(window) = app.get_webview_window(label) {
-        if anchor_to_status {
-            if window.is_visible().unwrap_or(false) {
-                let _ = window.hide();
-                return;
-            }
-            if popover_was_just_auto_hidden() {
-                return;
-            }
-        }
-        if anchor_to_status {
-            let _ = window.set_effects(popover_window_effects());
-            position_window_below_status(app, &window, width, height);
-        }
         let _ = window.show();
         let _ = window.set_focus();
-    } else {
-        let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
-            .title(title)
-            .inner_size(width, height)
-            .resizable(false)
-            .visible(!anchor_to_status);
-        if anchor_to_status {
-            builder = builder
-                .decorations(false)
-                .transparent(true)
-                .effects(popover_window_effects())
-                .always_on_top(true)
-                .skip_taskbar(true)
-                .shadow(true);
-        }
-        if let Ok(window) = builder.build() {
-            if anchor_to_status {
-                attach_popover_autohide(&window);
-                position_window_below_status(app, &window, width, height);
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-        }
-    }
-}
-
-fn popover_window_effects() -> tauri::utils::config::WindowEffectsConfig {
-    EffectsBuilder::new()
-        .effect(Effect::Popover)
-        .state(EffectState::Active)
-        .radius(22.0)
+    } else if let Ok(window) = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+        .title(title)
+        .inner_size(width, height)
+        .resizable(false)
+        .visible(true)
         .build()
-}
-
-fn attach_popover_autohide<R: tauri::Runtime>(window: &WebviewWindow<R>) {
-    let popover = window.clone();
-    window.on_window_event(move |event| {
-        if matches!(event, WindowEvent::Focused(false)) && popover.is_visible().unwrap_or(false) {
-            let _ = popover.hide();
-            record_popover_auto_hide();
-        }
-    });
-}
-
-fn record_popover_auto_hide() {
-    let state = LAST_POPOVER_AUTO_HIDE.get_or_init(|| Mutex::new(None));
-    if let Ok(mut last_hide) = state.lock() {
-        *last_hide = Some(Instant::now());
+    {
+        let _ = window.show();
+        let _ = window.set_focus();
     }
-}
-
-fn popover_was_just_auto_hidden() -> bool {
-    let state = LAST_POPOVER_AUTO_HIDE.get_or_init(|| Mutex::new(None));
-    state
-        .lock()
-        .ok()
-        .and_then(|last_hide| *last_hide)
-        .is_some_and(|last_hide| last_hide.elapsed() < POPOVER_AUTO_HIDE_DEBOUNCE)
-}
-
-fn position_window_below_status<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    window: &WebviewWindow<R>,
-    width: f64,
-    height: f64,
-) {
-    if let Some(position) = popover_position_below_status(app, width, height) {
-        let _ = window.set_position(position);
-    }
-}
-
-fn popover_position_below_status<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    width: f64,
-    height: f64,
-) -> Option<LogicalPosition<f64>> {
-    let anchor = crate::native_status::anchor_rect()?;
-    let monitor = app.primary_monitor().ok().flatten();
-    let (screen_width, screen_height) = if let Some(monitor) = monitor {
-        let scale = monitor.scale_factor();
-        (
-            monitor.size().width as f64 / scale,
-            monitor.size().height as f64 / scale,
-        )
-    } else {
-        (1440.0, 900.0)
-    };
-
-    let margin = 8.0;
-    let x = (anchor.x + anchor.width / 2.0 - width / 2.0)
-        .max(margin)
-        .min((screen_width - width - margin).max(margin));
-    let y = (screen_height - anchor.y + 4.0)
-        .max(margin)
-        .min((screen_height - height - margin).max(margin));
-    Some(LogicalPosition::new(x, y))
 }

@@ -10,8 +10,7 @@
     "windows": [],
     "security": {
       "csp": "default-src 'self'; connect-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
-    },
-    "macOSPrivateApi": true
+    }
   },
   "bundle": {
     "active": true,
