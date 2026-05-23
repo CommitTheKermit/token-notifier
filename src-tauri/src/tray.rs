@@ -75,6 +75,18 @@ pub fn color_for_percent(percent: u8) -> PercentColor {
 }
 
 pub fn format_tray_label(state: &TrayDisplayState) -> String {
+    let mut headers = Vec::new();
+    let mut percents = Vec::new();
+    push_compact_source_label(&mut headers, &mut percents, &state.cc);
+    push_compact_source_label(&mut headers, &mut percents, &state.cx);
+    if headers.is_empty() {
+        "Token Notifier".to_string()
+    } else {
+        format!("{}\n{}", headers.join("   "), percents.join("  "))
+    }
+}
+
+pub fn format_tray_tooltip(state: &TrayDisplayState) -> String {
     let mut parts = Vec::new();
     push_source_label(&mut parts, &state.cc, state.now);
     push_source_label(&mut parts, &state.cx, state.now);
@@ -86,7 +98,9 @@ pub fn format_tray_label(state: &TrayDisplayState) -> String {
 }
 
 pub fn build_main_tray(app: &App) -> tauri::Result<TrayIcon> {
-    let initial_title = format_tray_label(&TrayDisplayState::empty(Utc::now()));
+    let initial_state = TrayDisplayState::empty(Utc::now());
+    let initial_title = format_tray_label(&initial_state);
+    let initial_tooltip = format_tray_tooltip(&initial_state);
     crate::native_status::install_initial(&app.handle().clone(), initial_title.clone());
     let icon = tray_status_icon();
 
@@ -94,7 +108,7 @@ pub fn build_main_tray(app: &App) -> tauri::Result<TrayIcon> {
         .icon(icon)
         .icon_as_template(true)
         .title(initial_title)
-        .tooltip("Token Notifier")
+        .tooltip(initial_tooltip)
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
             if matches!(
@@ -141,11 +155,35 @@ pub fn update_main_tray<R: tauri::Runtime>(
     state: &TrayDisplayState,
 ) -> tauri::Result<()> {
     let title = format_tray_label(state);
+    let tooltip = format_tray_tooltip(state);
     crate::native_status::update_title(app, title.clone());
     if let Some(tray) = app.tray_by_id(MAIN_TRAY_ID) {
         tray.set_title(Some(title))?;
+        tray.set_tooltip(Some(tooltip))?;
     }
     Ok(())
+}
+
+fn push_compact_source_label(
+    headers: &mut Vec<String>,
+    percents: &mut Vec<String>,
+    source: &SourceTrayState,
+) {
+    if !source.enabled {
+        return;
+    }
+
+    let prefix = match source.source {
+        UsageSource::ClaudeCode => "CC",
+        UsageSource::Codex => "CX",
+    };
+    let percent = source
+        .percent_used
+        .map(|value| format!("{value}%"))
+        .unwrap_or_else(|| "--%".to_string());
+    let estimate = if source.estimated { "~" } else { "" };
+    headers.push(prefix.to_string());
+    percents.push(format!("{estimate}{percent}"));
 }
 
 fn push_source_label(parts: &mut Vec<String>, source: &SourceTrayState, now: DateTime<Utc>) {
@@ -203,7 +241,8 @@ mod tests {
         state.cc.percent_used = Some(73);
         state.cc.reset_at = Some(now + Duration::minutes(75));
         state.cx.enabled = false;
-        assert_eq!(format_tray_label(&state), "CC  73% ↻1h15m");
+        assert_eq!(format_tray_label(&state), "CC\n73%");
+        assert_eq!(format_tray_tooltip(&state), "CC  73% ↻1h15m");
     }
 
     #[test]
@@ -214,7 +253,10 @@ mod tests {
         state.cx.reset_at = Some(now + Duration::minutes(5));
         state.cx.estimated = true;
         let label = format_tray_label(&state);
-        assert!(label.contains("CX ~ 91% ↻5m"));
+        let tooltip = format_tray_tooltip(&state);
+        assert!(label.contains("CX"));
+        assert!(label.contains("~91%"));
+        assert!(tooltip.contains("CX ~ 91% ↻5m"));
     }
 }
 
