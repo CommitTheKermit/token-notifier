@@ -9,7 +9,7 @@ pub struct SourceSettings {
     pub thresholds: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppSettings {
     pub claude_code: SourceSettings,
     pub codex: SourceSettings,
@@ -44,17 +44,6 @@ impl Default for RemoteSyncSettings {
             anthropic_enabled: true,
             interval_minutes: 30,
             lookback_hours: 48,
-        }
-    }
-}
-
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            claude_code: SourceSettings::default(),
-            codex: SourceSettings::default(),
-            remote_sync: RemoteSyncSettings::default(),
-            autostart_enabled: false,
         }
     }
 }

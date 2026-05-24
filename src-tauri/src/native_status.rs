@@ -185,8 +185,9 @@ mod macos {
                 }
             }
 
-            let popover = match state.popover.borrow().as_ref() {
-                Some(popover) => popover.clone(),
+            let existing_popover = state.popover.borrow().as_ref().cloned();
+            let popover = match existing_popover {
+                Some(popover) => popover,
                 None => {
                     let popover = NSPopover::init(NSPopover::alloc(mtm));
                     popover.setBehavior(NSPopoverBehavior::Transient);
@@ -476,6 +477,7 @@ mod macos {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_text(
         text: &str,
         x: f64,

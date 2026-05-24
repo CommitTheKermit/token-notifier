@@ -2,7 +2,11 @@ use crate::parser::{UsageEvent, UsageSource};
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
+
+const LOCAL_ACCOUNTING_GENERATION_KEY: &str = "local_accounting_generation";
+const CURRENT_LOCAL_ACCOUNTING_GENERATION: &str = "2";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HourlyPoint {
@@ -95,12 +99,42 @@ impl UsageStore {
                 status TEXT NOT NULL,
                 message TEXT
             );
+            CREATE TABLE IF NOT EXISTS processed_usage_event (
+                source TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                recorded_at INTEGER NOT NULL,
+                PRIMARY KEY (source, event_id)
+            );
+            CREATE TABLE IF NOT EXISTS parser_state (
+                parser TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value INTEGER NOT NULL,
+                PRIMARY KEY (parser, key)
+            );
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             ",
         )?;
+        self.rebase_local_aggregates_if_needed()?;
         Ok(())
     }
 
-    pub fn record_usage_event(&self, event: &UsageEvent) -> anyhow::Result<()> {
+    pub fn record_usage_event(&self, event: &UsageEvent) -> anyhow::Result<bool> {
+        let inserted = self.conn.execute(
+            "INSERT OR IGNORE INTO processed_usage_event (source, event_id, recorded_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                event.source.as_str(),
+                event.event_id,
+                Utc::now().timestamp()
+            ],
+        )?;
+        if inserted == 0 {
+            return Ok(false);
+        }
+
         let hour = truncate_to_hour(event.occurred_at);
         let day = truncate_to_day(event.occurred_at);
         let source = event.source.as_str();
@@ -116,6 +150,43 @@ impl UsageStore {
              VALUES (?1, ?2, ?3)
              ON CONFLICT(source, day_start) DO UPDATE SET tokens_used = tokens_used + excluded.tokens_used",
             params![source, day.timestamp(), tokens],
+        )?;
+        Ok(true)
+    }
+
+    pub fn get_parser_state_value(&self, parser: &str, key: &str) -> anyhow::Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM parser_state WHERE parser = ?1 AND key = ?2",
+                params![parser, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_parser_state_values(&self, parser: &str) -> anyhow::Result<HashMap<String, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM parser_state WHERE parser = ?1")?;
+        let rows = stmt.query_map(params![parser], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn set_parser_state_value(
+        &self,
+        parser: &str,
+        key: &str,
+        value: i64,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO parser_state (parser, key, value)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(parser, key) DO UPDATE SET value = excluded.value",
+            params![parser, key, value],
         )?;
         Ok(())
     }
@@ -313,6 +384,40 @@ impl UsageStore {
             .optional()?;
         Ok(value.unwrap_or(0))
     }
+
+    fn rebase_local_aggregates_if_needed(&self) -> anyhow::Result<()> {
+        let current: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = ?1",
+                params![LOCAL_ACCOUNTING_GENERATION_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() == Some(CURRENT_LOCAL_ACCOUNTING_GENERATION) {
+            return Ok(());
+        }
+
+        self.conn.execute_batch(
+            "
+            DELETE FROM hourly_bucket;
+            DELETE FROM daily_rollup;
+            DELETE FROM threshold_state;
+            DELETE FROM processed_usage_event;
+            DELETE FROM parser_state;
+            ",
+        )?;
+        self.conn.execute(
+            "INSERT INTO schema_meta (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![
+                LOCAL_ACCOUNTING_GENERATION_KEY,
+                CURRENT_LOCAL_ACCOUNTING_GENERATION
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 fn truncate_to_hour(dt: DateTime<Utc>) -> DateTime<Utc> {
@@ -391,5 +496,58 @@ mod tests {
 
         let rollup = store.rollups_for(UsageSource::Codex, at).unwrap();
         assert_eq!(rollup.day_tokens, 175);
+    }
+
+    #[test]
+    fn duplicate_usage_events_are_not_counted_twice() {
+        let store = UsageStore::in_memory().expect("store");
+        let at = Utc.with_ymd_and_hms(2026, 5, 21, 10, 15, 0).unwrap();
+        let event = usage_event(UsageSource::ClaudeCode, at, 100);
+
+        assert!(store.record_usage_event(&event).unwrap());
+        assert!(!store.record_usage_event(&event).unwrap());
+
+        let rollup = store.rollups_for(UsageSource::ClaudeCode, at).unwrap();
+        assert_eq!(rollup.day_tokens, 100);
+    }
+
+    #[test]
+    fn opening_legacy_store_rebases_polluted_local_aggregates() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("usage.sqlite");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE hourly_bucket (
+                    source TEXT NOT NULL,
+                    hour_start INTEGER NOT NULL,
+                    tokens_used INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (source, hour_start)
+                );
+                CREATE TABLE daily_rollup (
+                    source TEXT NOT NULL,
+                    day_start INTEGER NOT NULL,
+                    tokens_used INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (source, day_start)
+                );
+                CREATE TABLE threshold_state (
+                    source TEXT NOT NULL,
+                    window_id TEXT NOT NULL,
+                    threshold INTEGER NOT NULL,
+                    notified_at INTEGER NOT NULL,
+                    PRIMARY KEY (source, window_id, threshold)
+                );
+                INSERT INTO hourly_bucket VALUES ('cc', 1779519600, 999);
+                INSERT INTO daily_rollup VALUES ('cc', 1779494400, 999);
+                ",
+            )
+            .unwrap();
+        }
+
+        let store = UsageStore::open(&db_path).unwrap();
+        let at = Utc.with_ymd_and_hms(2026, 5, 21, 10, 15, 0).unwrap();
+        let rollup = store.rollups_for(UsageSource::ClaudeCode, at).unwrap();
+        assert_eq!(rollup.day_tokens, 0);
     }
 }

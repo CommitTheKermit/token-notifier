@@ -322,6 +322,29 @@ fn format_countdown(now: DateTime<Utc>, reset_at: DateTime<Utc>) -> String {
     }
 }
 
+fn open_or_focus_window<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    label: &str,
+    url: &str,
+    title: &str,
+    width: f64,
+    height: f64,
+) {
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.show();
+        let _ = window.set_focus();
+    } else if let Ok(window) = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+        .title(title)
+        .inner_size(width, height)
+        .resizable(false)
+        .visible(true)
+        .build()
+    {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,28 +409,5 @@ mod tests {
         assert!(label.contains("~91%"));
         assert!(label.contains("0.1h"));
         assert!(tooltip.contains("CX ~ 91% ↻5m"));
-    }
-}
-
-fn open_or_focus_window<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    label: &str,
-    url: &str,
-    title: &str,
-    width: f64,
-    height: f64,
-) {
-    if let Some(window) = app.get_webview_window(label) {
-        let _ = window.show();
-        let _ = window.set_focus();
-    } else if let Ok(window) = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
-        .title(title)
-        .inner_size(width, height)
-        .resizable(false)
-        .visible(true)
-        .build()
-    {
-        let _ = window.show();
-        let _ = window.set_focus();
     }
 }

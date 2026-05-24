@@ -107,7 +107,7 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             tray::build_main_tray(app)?;
             runtime::start_background_runtime(app.handle().clone())
-                .map_err(|error| tauri::Error::Anyhow(error.into()))?;
+                .map_err(tauri::Error::Anyhow)?;
             Ok(())
         })
         .build(tauri::generate_context!())

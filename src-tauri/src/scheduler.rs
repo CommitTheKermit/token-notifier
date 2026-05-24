@@ -66,14 +66,21 @@ impl UsageScheduler {
             return Ok(None);
         }
 
+        let mut fresh_events = Vec::new();
         {
             let store = self.store.lock().expect("usage store lock");
             for event in &events {
-                store.record_usage_event(event)?;
+                if store.record_usage_event(event)? {
+                    fresh_events.push(event.clone());
+                }
             }
         }
 
-        let snapshots = self.estimator.ingest(&events);
+        if fresh_events.is_empty() {
+            return Ok(None);
+        }
+
+        let snapshots = self.estimator.ingest(&fresh_events);
         let outcome = PollOutcome {
             generation: generation_at_dispatch,
             events_read: events.len(),
@@ -219,5 +226,25 @@ mod tests {
         assert_eq!(outcome.events_read, 1);
         assert_eq!(outcome.snapshots[0].source, UsageSource::Codex);
         assert!(outcome.snapshots[0].estimated);
+    }
+
+    #[test]
+    fn duplicate_events_do_not_refresh_current_snapshots() {
+        let at = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
+        let event = usage_event(UsageSource::Codex, at, 20);
+        let mut scheduler = UsageScheduler::new(
+            vec![Box::new(FakeParser::default())],
+            WindowEstimator::default(),
+            UsageStore::in_memory().unwrap(),
+        );
+
+        assert!(scheduler
+            .commit_events_if_fresh(0, vec![event.clone()])
+            .unwrap()
+            .is_some());
+        assert!(scheduler
+            .commit_events_if_fresh(0, vec![event])
+            .unwrap()
+            .is_none());
     }
 }

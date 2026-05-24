@@ -6,11 +6,17 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+const PARSER_NAME: &str = "claude_code";
+const INITIALIZED_KEY: &str = "__initialized";
+
 #[derive(Debug, Default)]
 pub struct ClaudeCodeParser {
     roots: Vec<PathBuf>,
     explicit_files: Vec<PathBuf>,
     offsets: HashMap<PathBuf, u64>,
+    state_db_path: Option<PathBuf>,
+    state_loaded: bool,
+    initialized: bool,
 }
 
 impl ClaudeCodeParser {
@@ -22,6 +28,9 @@ impl ClaudeCodeParser {
             roots,
             explicit_files: Vec::new(),
             offsets: HashMap::new(),
+            state_db_path: crate::config::database_path(),
+            state_loaded: false,
+            initialized: false,
         }
     }
 
@@ -30,7 +39,16 @@ impl ClaudeCodeParser {
             roots: Vec::new(),
             explicit_files: files,
             offsets: HashMap::new(),
+            state_db_path: None,
+            state_loaded: false,
+            initialized: false,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_state_db_path(mut self, path: PathBuf) -> Self {
+        self.state_db_path = Some(path);
+        self
     }
 
     fn discover_files(&self) -> Vec<PathBuf> {
@@ -61,11 +79,13 @@ impl ClaudeCodeParser {
         let mut reader = BufReader::new(file);
         let mut events = Vec::new();
         let mut line = String::new();
-        let mut line_no = 0usize;
 
-        while reader.read_line(&mut line)? != 0 {
-            line_no += 1;
-            if let Some(event) = parse_usage_line(path, line_no, line.trim_end()) {
+        loop {
+            let line_offset = reader.stream_position()?;
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            if let Some(event) = parse_usage_line(path, line_offset, line.trim_end()) {
                 events.push(event);
             }
             line.clear();
@@ -73,17 +93,75 @@ impl ClaudeCodeParser {
 
         let new_offset = reader.stream_position()?;
         self.offsets.insert(path.to_path_buf(), new_offset);
+        self.save_offset(path, new_offset)?;
         Ok(events)
+    }
+
+    fn load_state_if_needed(&mut self) -> anyhow::Result<()> {
+        if self.state_loaded {
+            return Ok(());
+        }
+        self.state_loaded = true;
+        let Some(path) = &self.state_db_path else {
+            self.initialized = true;
+            return Ok(());
+        };
+        let store = crate::storage::UsageStore::open(path)?;
+        self.initialized = store
+            .get_parser_state_value(PARSER_NAME, INITIALIZED_KEY)?
+            .is_some_and(|value| value == 1);
+        for (key, value) in store.get_parser_state_values(PARSER_NAME)? {
+            if key == INITIALIZED_KEY || value < 0 {
+                continue;
+            }
+            self.offsets.insert(PathBuf::from(key), value as u64);
+        }
+        Ok(())
+    }
+
+    fn save_offset(&self, path: &Path, offset: u64) -> anyhow::Result<()> {
+        let Some(db_path) = &self.state_db_path else {
+            return Ok(());
+        };
+        crate::storage::UsageStore::open(db_path)?.set_parser_state_value(
+            PARSER_NAME,
+            path.to_string_lossy().as_ref(),
+            offset.min(i64::MAX as u64) as i64,
+        )
+    }
+
+    fn mark_initialized(&mut self) -> anyhow::Result<()> {
+        self.initialized = true;
+        let Some(path) = &self.state_db_path else {
+            return Ok(());
+        };
+        crate::storage::UsageStore::open(path)?.set_parser_state_value(
+            PARSER_NAME,
+            INITIALIZED_KEY,
+            1,
+        )
     }
 }
 
 impl LocalLogParser for ClaudeCodeParser {
     fn read_delta(&mut self) -> anyhow::Result<Vec<UsageEvent>> {
+        self.load_state_if_needed()?;
         let mut events = Vec::new();
+        let should_baseline = self.state_db_path.is_some() && !self.initialized;
         for path in self.discover_files() {
             if path.is_file() {
-                events.extend(self.read_file_delta(&path)?);
+                if should_baseline {
+                    let size = fs::metadata(&path)?.len();
+                    self.offsets.insert(path.clone(), size);
+                    self.save_offset(&path, size)?;
+                } else {
+                    events.extend(self.read_file_delta(&path)?);
+                }
             }
+        }
+        if should_baseline {
+            self.mark_initialized()?;
+            return Ok(Vec::new());
         }
         events.sort_by_key(|event| event.occurred_at);
         Ok(events)
@@ -105,7 +183,7 @@ fn collect_jsonl(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn parse_usage_line(path: &Path, line_no: usize, line: &str) -> Option<UsageEvent> {
+fn parse_usage_line(path: &Path, line_offset: u64, line: &str) -> Option<UsageEvent> {
     if line.trim().is_empty() {
         return None;
     }
@@ -139,9 +217,46 @@ fn parse_usage_line(path: &Path, line_no: usize, line: &str) -> Option<UsageEven
 
     Some(UsageEvent {
         source: UsageSource::ClaudeCode,
-        event_id: format!("{}:{line_no}", path.display()),
+        event_id: format!("{}:{line_offset}", path.display()),
         occurred_at,
         tokens,
         metadata: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::LocalLogParser;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    #[test]
+    fn persisted_state_baselines_existing_claude_logs_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = dir.path().join("session.jsonl");
+        let db = dir.path().join("usage.sqlite");
+        append_usage_line(&log, 10);
+
+        let mut parser = ClaudeCodeParser::from_files(vec![log.clone()]).with_state_db_path(db);
+        assert!(parser.read_delta().unwrap().is_empty());
+
+        append_usage_line(&log, 7);
+        let events = parser.read_delta().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tokens, 7);
+    }
+
+    fn append_usage_line(path: &Path, output_tokens: u64) {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open log");
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2026-05-21T01:01:24.096Z","message":{{"usage":{{"output_tokens":{output_tokens}}}}}}}"#
+        )
+        .unwrap();
+    }
 }

@@ -26,6 +26,7 @@ pub fn start_background_runtime<R: tauri::Runtime>(app: AppHandle<R>) -> anyhow:
         store,
     );
 
+    let app_for_remote_sync = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(MIN_POLL_INTERVAL_SECS));
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -59,20 +60,23 @@ pub fn start_background_runtime<R: tauri::Runtime>(app: AppHandle<R>) -> anyhow:
         }
     });
 
-    start_remote_sync_runtime();
+    start_remote_sync_runtime(app_for_remote_sync);
 
     Ok(())
 }
 
-fn start_remote_sync_runtime() {
+fn start_remote_sync_runtime<R: tauri::Runtime>(app: AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         loop {
             let settings = load_settings().remote_sync;
             if settings.enabled {
                 if let Some(db_path) = database_path() {
                     let now = Utc::now();
-                    if let Err(error) = remote_sync::sync_once(db_path, &settings, now).await {
-                        eprintln!("token-notifier remote sync failed: {error:#}");
+                    match remote_sync::sync_once(db_path, &settings, now).await {
+                        Ok(()) => {
+                            let _ = update_main_tray(&app, &crate::tray::latest_display_state());
+                        }
+                        Err(error) => eprintln!("token-notifier remote sync failed: {error:#}"),
                     }
                 }
                 time::sleep(Duration::from_secs(settings.interval_minutes * 60)).await;
