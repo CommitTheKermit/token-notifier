@@ -1,6 +1,7 @@
 use super::{parse_epoch_like_timestamp, LocalLogParser, UsageEvent, UsageSource};
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -12,12 +13,18 @@ const PARSER_NAME: &str = "codex";
 const INITIALIZED_KEY: &str = "__initialized";
 const MAX_RATE_LIMIT_SESSION_FILES: usize = 12;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexRateLimitStatus {
     pub used_percent: u8,
     pub remaining_percent: u8,
     pub reset_at: DateTime<Utc>,
     pub window_minutes: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CodexRateLimitCacheFile {
+    timestamp: DateTime<Utc>,
+    status: CodexRateLimitStatus,
 }
 
 #[derive(Debug, Default)]
@@ -58,7 +65,11 @@ impl CodexParser {
 
     pub fn latest_rate_limit_status() -> Option<CodexRateLimitStatus> {
         let root = dirs::home_dir()?.join(".codex").join("sessions");
-        latest_rate_limit_status_from_root(&root).ok().flatten()
+        let session_status = latest_rate_limit_observation_from_root(&root)
+            .ok()
+            .flatten();
+        let cached_status = latest_cached_rate_limit_status();
+        newer_rate_limit_observation(cached_status, session_status).map(|(_, status)| status)
     }
 
     fn load_state_if_needed(&mut self) -> anyhow::Result<()> {
@@ -165,7 +176,14 @@ impl LocalLogParser for CodexParser {
     }
 }
 
+#[cfg(test)]
 fn latest_rate_limit_status_from_root(root: &Path) -> anyhow::Result<Option<CodexRateLimitStatus>> {
+    Ok(latest_rate_limit_observation_from_root(root)?.map(|(_, status)| status))
+}
+
+fn latest_rate_limit_observation_from_root(
+    root: &Path,
+) -> anyhow::Result<Option<(DateTime<Utc>, CodexRateLimitStatus)>> {
     let mut files = Vec::new();
     collect_jsonl_files(root, &mut files);
     files.sort_by(|left, right| {
@@ -195,7 +213,7 @@ fn latest_rate_limit_status_from_root(root: &Path) -> anyhow::Result<Option<Code
             }
         }
     }
-    Ok(latest.map(|(_, status)| status))
+    Ok(latest)
 }
 
 fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
@@ -252,6 +270,38 @@ fn parse_rate_limit_line(line: &str) -> Option<(DateTime<Utc>, CodexRateLimitSta
 
 fn rounded_percent(value: f64) -> u8 {
     value.round().clamp(0.0, 100.0) as u8
+}
+
+fn latest_cached_rate_limit_status() -> Option<(DateTime<Utc>, CodexRateLimitStatus)> {
+    let path = cached_status_path()?;
+    let raw = fs::read_to_string(path).ok()?;
+    let cache = serde_json::from_str::<CodexRateLimitCacheFile>(&raw).ok()?;
+    if cache.status.reset_at <= Utc::now() {
+        return None;
+    }
+    Some((cache.timestamp, cache.status))
+}
+
+fn cached_status_path() -> Option<PathBuf> {
+    crate::config::app_support_dir().map(|dir| dir.join("codex-rate-limit.json"))
+}
+
+fn newer_rate_limit_observation(
+    left: Option<(DateTime<Utc>, CodexRateLimitStatus)>,
+    right: Option<(DateTime<Utc>, CodexRateLimitStatus)>,
+) -> Option<(DateTime<Utc>, CodexRateLimitStatus)> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if left.0 >= right.0 {
+                Some(left)
+            } else {
+                Some(right)
+            }
+        }
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]
@@ -328,5 +378,34 @@ mod tests {
         assert_eq!(status.remaining_percent, 99);
         assert_eq!(status.window_minutes, 300);
         assert_eq!(status.reset_at.timestamp(), reset_at.timestamp());
+    }
+
+    #[test]
+    fn prefers_newer_cached_codex_status_over_stale_session_status() {
+        let reset_at = Utc::now() + Duration::hours(3);
+        let old = (
+            Utc::now() - Duration::minutes(10),
+            CodexRateLimitStatus {
+                used_percent: 23,
+                remaining_percent: 77,
+                reset_at,
+                window_minutes: 300,
+            },
+        );
+        let new = (
+            Utc::now(),
+            CodexRateLimitStatus {
+                used_percent: 63,
+                remaining_percent: 37,
+                reset_at,
+                window_minutes: 300,
+            },
+        );
+
+        let status = newer_rate_limit_observation(Some(new), Some(old))
+            .expect("status")
+            .1;
+        assert_eq!(status.used_percent, 63);
+        assert_eq!(status.remaining_percent, 37);
     }
 }
