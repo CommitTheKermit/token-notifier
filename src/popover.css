@@ -131,7 +131,8 @@ p,
 
 .source-heading,
 .meter,
-.reset-copy {
+.reset-copy,
+.status-copy {
   grid-column: 2;
 }
 
@@ -177,6 +178,21 @@ p,
   font-size: 12px;
 }
 
+.status-copy {
+  color: var(--muted-strong);
+  display: none;
+  font-size: 12px;
+}
+
+.source-row.no-percent .meter,
+.source-row.no-percent .reset-copy {
+  display: none;
+}
+
+.source-row.no-percent .status-copy {
+  display: block;
+}
+
 hr {
   background: var(--hairline);
   border: 0;
@@ -219,7 +235,7 @@ kbd {
 }
 
 #chart-summary {
-  max-width: 190px;
+  max-width: 220px;
   overflow: hidden;
   text-align: right;
   text-overflow: ellipsis;

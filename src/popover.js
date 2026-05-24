@@ -35,9 +35,19 @@ function formatReset(nowIso, resetIso) {
 function updateSourceCard(source, state, nowIso) {
   const prefix = source === 'claude_code' ? 'claude' : 'codex';
   const percent = state?.percent_used ?? null;
-  document.querySelector(`#${prefix}-percent`).textContent = percent ?? '--';
+  const row = document.querySelector(`[data-source="${source}"]`);
+  const percentEl = document.querySelector(`#${prefix}-percent`);
+  const unitEl = document.querySelector(`#${prefix}-percent-unit`);
+  const statusEl = document.querySelector(`#${prefix}-status`);
+  const hasPercent = percent !== null;
+  row?.classList.toggle('no-percent', source === 'codex' && !hasPercent);
+  percentEl.textContent = hasPercent
+    ? percent
+    : (state?.status_message ?? (source === 'codex' ? '공식 실시간 데이터 없음' : '--'));
+  if (unitEl) unitEl.textContent = hasPercent ? '%' : '';
   document.querySelector(`#${prefix}-meter`).style.width = `${Math.min(percent ?? 0, 100)}%`;
   document.querySelector(`#${prefix}-reset`).textContent = formatReset(nowIso, state?.reset_at);
+  if (statusEl) statusEl.textContent = state?.status_message ?? '';
 }
 
 function renderTrayState(state) {
@@ -56,16 +66,18 @@ function toChartData(points) {
   const labels = [...byHour.keys()].sort();
   return {
     labels: labels.map(hourLabel),
-    datasets: Object.entries(SOURCES).map(([source, meta]) => ({
-      label: meta.shortLabel,
-      borderColor: cssVar(meta.cssColor, '#d6e0cd'),
-      backgroundColor: cssVar(meta.cssColor, '#d6e0cd'),
-      borderWidth: 2,
-      pointRadius: 0,
-      pointHitRadius: 8,
-      tension: 0.35,
-      data: labels.map((label) => byHour.get(label)?.[source] ?? 0),
-    })),
+    datasets: Object.entries(SOURCES)
+      .filter(([source]) => source === 'claude_code')
+      .map(([source, meta]) => ({
+        label: meta.shortLabel,
+        borderColor: cssVar(meta.cssColor, '#d6e0cd'),
+        backgroundColor: cssVar(meta.cssColor, '#d6e0cd'),
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHitRadius: 8,
+        tension: 0.35,
+        data: labels.map((label) => byHour.get(label)?.[source] ?? 0),
+      })),
   };
 }
 
@@ -104,7 +116,7 @@ async function render() {
     },
   });
 
-  const total = rollups.reduce(
+  const total = rollups.filter((item) => item.source === 'claude_code').reduce(
     (acc, item) => ({
       day: acc.day + item.day_tokens,
       week: acc.week + item.week_tokens,

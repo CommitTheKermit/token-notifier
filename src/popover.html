@@ -25,10 +25,11 @@
         <article class="source-row" data-source="codex">
           <div class="source-heading">
             <strong>Codex</strong>
-            <span><b id="codex-percent">--</b>%</span>
+            <span><b id="codex-percent">공식 데이터 없음</b><span id="codex-percent-unit"></span></span>
           </div>
           <div class="meter" aria-hidden="true"><span id="codex-meter"></span></div>
           <p class="reset-copy">다음 갱신까지 <span id="codex-reset">--</span></p>
+          <p class="status-copy" id="codex-status">공식 실시간 데이터 없음</p>
         </article>
         <hr />
         <button id="settings-action" class="settings-hint" type="button">
@@ -43,7 +44,7 @@
             <p class="eyebrow">사용량 그래프</p>
             <h1>Last 24 hours</h1>
           </div>
-          <p id="chart-summary">로컬 추정 + API 보정</p>
+          <p id="chart-summary">Claude 로컬 추정 · Codex 공식 관측값만 표시</p>
         </header>
         <canvas id="usage-chart" width="520" height="190" aria-label="24 hour usage line graph"></canvas>
       </section>

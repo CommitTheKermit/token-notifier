@@ -392,7 +392,7 @@ mod macos {
             bounds,
         );
         draw_text(
-            "로컬 추정 + API 보정",
+            "Claude 로컬 추정 · Codex 공식 관측",
             width - 160.0,
             graph_top + 24.0,
             144.0,

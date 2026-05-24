@@ -23,6 +23,9 @@ pub struct SourceTrayState {
     pub percent_used: Option<u8>,
     pub reset_at: Option<DateTime<Utc>>,
     pub estimated: bool,
+    pub status_source: Option<String>,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub status_message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +44,9 @@ impl TrayDisplayState {
                 percent_used: None,
                 reset_at: None,
                 estimated: false,
+                status_source: None,
+                observed_at: None,
+                status_message: None,
             },
             cx: SourceTrayState {
                 source: UsageSource::Codex,
@@ -48,6 +54,9 @@ impl TrayDisplayState {
                 percent_used: None,
                 reset_at: None,
                 estimated: false,
+                status_source: Some("unavailable".to_string()),
+                observed_at: None,
+                status_message: Some("공식 실시간 데이터 없음".to_string()),
             },
             now,
         }
@@ -58,11 +67,21 @@ impl TrayDisplayState {
         for snapshot in snapshots {
             let target = match snapshot.source {
                 UsageSource::ClaudeCode => &mut state.cc,
-                UsageSource::Codex => &mut state.cx,
+                UsageSource::Codex => continue,
             };
             target.percent_used = Some(snapshot.percent_used);
             target.reset_at = Some(snapshot.reset_at);
             target.estimated = snapshot.estimated;
+            target.status_source = Some(
+                if snapshot.estimated {
+                    "local_estimate"
+                } else {
+                    "official_provider"
+                }
+                .to_string(),
+            );
+            target.observed_at = None;
+            target.status_message = None;
         }
         state
     }
@@ -211,11 +230,21 @@ fn native_popover_source(source: &SourceTrayState, now: DateTime<Utc>) -> Native
     let percent_text = source
         .percent_used
         .map(|value| format!("{value}%"))
-        .unwrap_or_else(|| "--%".to_string());
+        .unwrap_or_else(|| {
+            source
+                .status_message
+                .clone()
+                .unwrap_or_else(|| "--".to_string())
+        });
     let reset_text = source
         .reset_at
         .map(|reset_at| format!("다음 갱신까지 {}", format_countdown(now, reset_at)))
-        .unwrap_or_else(|| "다음 갱신까지 --".to_string());
+        .unwrap_or_else(|| {
+            source
+                .status_message
+                .clone()
+                .unwrap_or_else(|| "다음 갱신까지 --".to_string())
+        });
 
     NativePopoverSourceState {
         label: label.to_string(),
@@ -229,13 +258,18 @@ fn rollup_totals() -> Option<(u64, u64, u64)> {
     let path = crate::config::database_path()?;
     let store = crate::storage::UsageStore::open(path).ok()?;
     let rollups = store.get_rollups(Utc::now()).ok()?;
-    Some(rollups.into_iter().fold((0, 0, 0), |acc, item| {
-        (
-            acc.0 + item.day_tokens,
-            acc.1 + item.week_tokens,
-            acc.2 + item.month_tokens,
-        )
-    }))
+    Some(
+        rollups
+            .into_iter()
+            .filter(|item| item.source == UsageSource::ClaudeCode)
+            .fold((0, 0, 0), |acc, item| {
+                (
+                    acc.0 + item.day_tokens,
+                    acc.1 + item.week_tokens,
+                    acc.2 + item.month_tokens,
+                )
+            }),
+    )
 }
 
 fn format_tokens(value: u64) -> String {
@@ -257,6 +291,9 @@ fn push_grid_source_label(
     now: DateTime<Utc>,
 ) {
     if !source.enabled {
+        return;
+    }
+    if source.source == UsageSource::Codex && source.percent_used.is_none() {
         return;
     }
 
@@ -283,10 +320,15 @@ fn push_source_label(parts: &mut Vec<String>, source: &SourceTrayState, now: Dat
         UsageSource::ClaudeCode => "CC",
         UsageSource::Codex => "CX",
     };
-    let percent = source
-        .percent_used
-        .map(|value| format!("{value:>3}%"))
-        .unwrap_or_else(|| " --%".to_string());
+    let Some(percent_value) = source.percent_used else {
+        let message = source
+            .status_message
+            .clone()
+            .unwrap_or_else(|| "데이터 없음".to_string());
+        parts.push(format!("{prefix} {message}"));
+        return;
+    };
+    let percent = format!("{percent_value:>3}%");
     let estimate = if source.estimated { "~" } else { "" };
     let reset = source
         .reset_at
@@ -409,5 +451,25 @@ mod tests {
         assert!(label.contains("~91%"));
         assert!(label.contains("0.1h"));
         assert!(tooltip.contains("CX ~ 91% ↻5m"));
+    }
+
+    #[test]
+    fn codex_local_estimator_snapshots_do_not_populate_tray_percent() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
+        let snapshot = UsageSnapshot {
+            source: UsageSource::Codex,
+            window_id: "cx-local".to_string(),
+            window_start: now,
+            reset_at: now + Duration::hours(5),
+            tokens_used: 75,
+            quota_tokens: 100,
+            percent_used: 75,
+            estimated: true,
+        };
+
+        let state = TrayDisplayState::from_snapshots(&[snapshot], now);
+        assert_eq!(state.cx.percent_used, None);
+        assert_eq!(state.cx.reset_at, None);
+        assert_eq!(state.cx.status_source.as_deref(), Some("unavailable"));
     }
 }

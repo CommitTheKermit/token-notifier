@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 const LOCAL_ACCOUNTING_GENERATION_KEY: &str = "local_accounting_generation";
-const CURRENT_LOCAL_ACCOUNTING_GENERATION: &str = "2";
+const CURRENT_LOCAL_ACCOUNTING_GENERATION: &str = "3";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HourlyPoint {
@@ -398,15 +398,27 @@ impl UsageStore {
             return Ok(());
         }
 
-        self.conn.execute_batch(
-            "
-            DELETE FROM hourly_bucket;
-            DELETE FROM daily_rollup;
-            DELETE FROM threshold_state;
-            DELETE FROM processed_usage_event;
-            DELETE FROM parser_state;
-            ",
-        )?;
+        if current.as_deref() == Some("2") {
+            self.conn.execute_batch(
+                "
+                DELETE FROM hourly_bucket WHERE source = 'cx';
+                DELETE FROM daily_rollup WHERE source = 'cx';
+                DELETE FROM threshold_state WHERE source = 'cx';
+                DELETE FROM processed_usage_event WHERE source = 'cx';
+                DELETE FROM parser_state WHERE parser = 'codex';
+                ",
+            )?;
+        } else {
+            self.conn.execute_batch(
+                "
+                DELETE FROM hourly_bucket;
+                DELETE FROM daily_rollup;
+                DELETE FROM threshold_state;
+                DELETE FROM processed_usage_event;
+                DELETE FROM parser_state;
+                ",
+            )?;
+        }
         self.conn.execute(
             "INSERT INTO schema_meta (key, value)
              VALUES (?1, ?2)
@@ -549,5 +561,74 @@ mod tests {
         let at = Utc.with_ymd_and_hms(2026, 5, 21, 10, 15, 0).unwrap();
         let rollup = store.rollups_for(UsageSource::ClaudeCode, at).unwrap();
         assert_eq!(rollup.day_tokens, 0);
+    }
+
+    #[test]
+    fn generation_two_migration_removes_only_codex_local_accounting() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("usage.sqlite");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE hourly_bucket (
+                    source TEXT NOT NULL,
+                    hour_start INTEGER NOT NULL,
+                    tokens_used INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (source, hour_start)
+                );
+                CREATE TABLE daily_rollup (
+                    source TEXT NOT NULL,
+                    day_start INTEGER NOT NULL,
+                    tokens_used INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (source, day_start)
+                );
+                CREATE TABLE threshold_state (
+                    source TEXT NOT NULL,
+                    window_id TEXT NOT NULL,
+                    threshold INTEGER NOT NULL,
+                    notified_at INTEGER NOT NULL,
+                    PRIMARY KEY (source, window_id, threshold)
+                );
+                CREATE TABLE processed_usage_event (
+                    source TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    recorded_at INTEGER NOT NULL,
+                    PRIMARY KEY (source, event_id)
+                );
+                CREATE TABLE parser_state (
+                    parser TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value INTEGER NOT NULL,
+                    PRIMARY KEY (parser, key)
+                );
+                CREATE TABLE schema_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO schema_meta VALUES ('local_accounting_generation', '2');
+                INSERT INTO hourly_bucket VALUES ('cc', 1779519600, 100);
+                INSERT INTO hourly_bucket VALUES ('cx', 1779519600, 200);
+                ",
+            )
+            .unwrap();
+        }
+
+        let store = UsageStore::open(&db_path).unwrap();
+        let at = Utc.with_ymd_and_hms(2026, 5, 21, 10, 15, 0).unwrap();
+        assert_eq!(
+            store
+                .rollups_for(UsageSource::ClaudeCode, at)
+                .unwrap()
+                .day_tokens,
+            100
+        );
+        assert_eq!(
+            store
+                .rollups_for(UsageSource::Codex, at)
+                .unwrap()
+                .day_tokens,
+            0
+        );
     }
 }

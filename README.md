@@ -1,6 +1,6 @@
 # token-notifier
 
-macOS 메뉴바에 Claude Code CLI와 Codex CLI의 rate-limit 윈도우 남은 % 및 리셋까지 남은 시간을 상시 표시하는 데스크톱 앱.
+macOS 메뉴바에 Claude Code CLI의 로컬 사용량 추정과 Codex CLI의 공식 rate-limit 관측값이 있을 때만 남은 % 및 리셋까지 남은 시간을 표시하는 데스크톱 앱.
 
 ## 개요
 
