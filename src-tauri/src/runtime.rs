@@ -1,6 +1,6 @@
 use crate::alerts::{send_notification, ThresholdEvaluator};
 use crate::config::{database_path, HiddenConfig};
-use crate::parser::claude_code::ClaudeCodeParser;
+use crate::parser::claude_code::{ClaudeCodeParser, ClaudeRateLimitStatus};
 use crate::parser::codex::{CodexParser, CodexRateLimitStatus};
 use crate::parser::UsageSource;
 use crate::remote_sync;
@@ -111,12 +111,27 @@ fn publish_tray_state<R: tauri::Runtime>(
 ) -> anyhow::Result<crate::settings::AppSettings> {
     let settings = load_settings();
     let mut tray_state = TrayDisplayState::from_snapshots(snapshots, Utc::now());
+    apply_live_claude_rate_limit(
+        &mut tray_state,
+        ClaudeCodeParser::latest_rate_limit_status(),
+    );
     apply_live_codex_rate_limit(&mut tray_state, CodexParser::latest_rate_limit_status());
     tray_state.cc.enabled = settings.claude_code.enabled;
     tray_state.cx.enabled = settings.codex.enabled;
     update_main_tray(app, &tray_state)?;
     app.emit("usage-update", &tray_state)?;
     Ok(settings)
+}
+
+fn apply_live_claude_rate_limit(
+    tray_state: &mut TrayDisplayState,
+    status: Option<ClaudeRateLimitStatus>,
+) {
+    if let Some(status) = status {
+        tray_state.cc.percent_used = Some(status.remaining_percent);
+        tray_state.cc.reset_at = Some(status.reset_at);
+        tray_state.cc.estimated = false;
+    }
 }
 
 fn apply_live_codex_rate_limit(
