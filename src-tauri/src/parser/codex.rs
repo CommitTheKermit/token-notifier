@@ -1,10 +1,24 @@
 use super::{parse_epoch_like_timestamp, LocalLogParser, UsageEvent, UsageSource};
+use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 const PARSER_NAME: &str = "codex";
 const INITIALIZED_KEY: &str = "__initialized";
+const MAX_RATE_LIMIT_SESSION_FILES: usize = 12;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRateLimitStatus {
+    pub used_percent: u8,
+    pub remaining_percent: u8,
+    pub reset_at: DateTime<Utc>,
+    pub window_minutes: u64,
+}
 
 #[derive(Debug, Default)]
 pub struct CodexParser {
@@ -40,6 +54,11 @@ impl CodexParser {
     pub fn with_state_db_path(mut self, path: PathBuf) -> Self {
         self.state_db_path = Some(path);
         self
+    }
+
+    pub fn latest_rate_limit_status() -> Option<CodexRateLimitStatus> {
+        let root = dirs::home_dir()?.join(".codex").join("sessions");
+        latest_rate_limit_status_from_root(&root).ok().flatten()
     }
 
     fn load_state_if_needed(&mut self) -> anyhow::Result<()> {
@@ -146,11 +165,103 @@ impl LocalLogParser for CodexParser {
     }
 }
 
+fn latest_rate_limit_status_from_root(root: &Path) -> anyhow::Result<Option<CodexRateLimitStatus>> {
+    let mut files = Vec::new();
+    collect_jsonl_files(root, &mut files);
+    files.sort_by(|left, right| {
+        file_modified_at(right)
+            .cmp(&file_modified_at(left))
+            .then_with(|| right.cmp(left))
+    });
+    files.truncate(MAX_RATE_LIMIT_SESSION_FILES);
+
+    let now = Utc::now();
+    let mut latest = None::<(DateTime<Utc>, CodexRateLimitStatus)>;
+    for file in files {
+        let reader = BufReader::new(File::open(file)?);
+        for line in reader.lines().map_while(Result::ok) {
+            let Some((timestamp, status)) = parse_rate_limit_line(&line) else {
+                continue;
+            };
+            if status.reset_at <= now {
+                continue;
+            }
+            let is_newer = latest
+                .as_ref()
+                .map(|(latest_timestamp, _)| timestamp > *latest_timestamp)
+                .unwrap_or(true);
+            if is_newer {
+                latest = Some((timestamp, status));
+            }
+        }
+    }
+    Ok(latest.map(|(_, status)| status))
+}
+
+fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl_files(&path, files);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            files.push(path);
+        }
+    }
+}
+
+fn file_modified_at(path: &Path) -> SystemTime {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+fn parse_rate_limit_line(line: &str) -> Option<(DateTime<Utc>, CodexRateLimitStatus)> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let timestamp = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
+        .with_timezone(&Utc);
+    let primary = value.get("payload")?.get("rate_limits")?.get("primary")?;
+    let used_percent = primary.get("used_percent").and_then(Value::as_f64)?;
+    let window_minutes = primary
+        .get("window_minutes")
+        .and_then(Value::as_u64)
+        .unwrap_or(300);
+    let resets_at = primary.get("resets_at").and_then(Value::as_i64)?;
+    let reset_at = Utc.timestamp_opt(resets_at, 0).single()?;
+    let used_percent = rounded_percent(used_percent);
+    let remaining_percent = 100u8.saturating_sub(used_percent);
+    Some((
+        timestamp,
+        CodexRateLimitStatus {
+            used_percent,
+            remaining_percent,
+            reset_at,
+            window_minutes,
+        },
+    ))
+}
+
+fn rounded_percent(value: f64) -> u8 {
+    value.round().clamp(0.0, 100.0) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::LocalLogParser;
+    use chrono::Duration;
     use rusqlite::{params, Connection};
+    use std::fs::OpenOptions;
+    use std::io::Write;
 
     #[test]
     fn persisted_state_baselines_existing_codex_threads_once() {
@@ -190,5 +301,32 @@ mod tests {
             params![id, tokens as i64],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn reads_latest_primary_rate_limit_as_remaining_percent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session = dir.path().join("rollout.jsonl");
+        let reset_at = Utc::now() + Duration::hours(3);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&session)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":1.0,"window_minutes":300,"resets_at":{}}}}}}}}}"#,
+            Utc::now().to_rfc3339(),
+            reset_at.timestamp()
+        )
+        .unwrap();
+
+        let status = latest_rate_limit_status_from_root(dir.path())
+            .unwrap()
+            .expect("rate limit");
+        assert_eq!(status.used_percent, 1);
+        assert_eq!(status.remaining_percent, 99);
+        assert_eq!(status.window_minutes, 300);
+        assert_eq!(status.reset_at.timestamp(), reset_at.timestamp());
     }
 }

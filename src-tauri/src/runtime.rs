@@ -1,7 +1,7 @@
 use crate::alerts::{send_notification, ThresholdEvaluator};
 use crate::config::{database_path, HiddenConfig};
 use crate::parser::claude_code::ClaudeCodeParser;
-use crate::parser::codex::CodexParser;
+use crate::parser::codex::{CodexParser, CodexRateLimitStatus};
 use crate::parser::UsageSource;
 use crate::remote_sync;
 use crate::scheduler::{UsageScheduler, MIN_POLL_INTERVAL_SECS};
@@ -47,14 +47,13 @@ pub fn start_background_runtime<R: tauri::Runtime>(app: AppHandle<R>) -> anyhow:
                         let app_for_reset = app.clone();
                         scheduler.schedule_reset(reset_at, move |generation| {
                             let _ = app_for_reset.emit("usage-reset", generation);
-                            let _ = update_main_tray(
-                                &app_for_reset,
-                                &TrayDisplayState::empty(Utc::now()),
-                            );
+                            let _ = publish_tray_state(&app_for_reset, &[]);
                         });
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    let _ = publish_tray_state(&app, &scheduler.current_snapshots());
+                }
                 Err(error) => eprintln!("token-notifier poll failed: {error:#}"),
             }
         }
@@ -91,12 +90,7 @@ fn handle_outcome<R: tauri::Runtime>(
     app: &AppHandle<R>,
     snapshots: &[crate::window_estimator::UsageSnapshot],
 ) -> anyhow::Result<()> {
-    let settings = load_settings();
-    let mut tray_state = TrayDisplayState::from_snapshots(snapshots, Utc::now());
-    tray_state.cc.enabled = settings.claude_code.enabled;
-    tray_state.cx.enabled = settings.codex.enabled;
-    update_main_tray(app, &tray_state)?;
-    app.emit("usage-update", &tray_state)?;
+    let settings = publish_tray_state(app, snapshots)?;
 
     let db_path =
         database_path().ok_or_else(|| anyhow::anyhow!("Could not resolve database path"))?;
@@ -109,6 +103,31 @@ fn handle_outcome<R: tauri::Runtime>(
         maybe_send_alert(app, &alert_store, source_settings, snapshot)?;
     }
     Ok(())
+}
+
+fn publish_tray_state<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    snapshots: &[crate::window_estimator::UsageSnapshot],
+) -> anyhow::Result<crate::settings::AppSettings> {
+    let settings = load_settings();
+    let mut tray_state = TrayDisplayState::from_snapshots(snapshots, Utc::now());
+    apply_live_codex_rate_limit(&mut tray_state, CodexParser::latest_rate_limit_status());
+    tray_state.cc.enabled = settings.claude_code.enabled;
+    tray_state.cx.enabled = settings.codex.enabled;
+    update_main_tray(app, &tray_state)?;
+    app.emit("usage-update", &tray_state)?;
+    Ok(settings)
+}
+
+fn apply_live_codex_rate_limit(
+    tray_state: &mut TrayDisplayState,
+    status: Option<CodexRateLimitStatus>,
+) {
+    if let Some(status) = status {
+        tray_state.cx.percent_used = Some(status.remaining_percent);
+        tray_state.cx.reset_at = Some(status.reset_at);
+        tray_state.cx.estimated = false;
+    }
 }
 
 fn maybe_send_alert<R: tauri::Runtime>(

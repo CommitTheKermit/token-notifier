@@ -48,6 +48,10 @@ impl UsageScheduler {
         Arc::clone(&self.window_generation_id)
     }
 
+    pub fn current_snapshots(&self) -> Vec<UsageSnapshot> {
+        self.estimator.current_snapshots()
+    }
+
     pub fn poll_once(&mut self) -> anyhow::Result<Option<PollOutcome>> {
         let generation_at_dispatch = self.generation();
         let mut events = Vec::new();
