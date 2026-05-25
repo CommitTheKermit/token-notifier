@@ -98,6 +98,7 @@ pub fn color_for_percent(percent: u8) -> PercentColor {
 }
 
 pub fn format_tray_label(state: &TrayDisplayState) -> String {
+    let state = display_ready_state(state);
     let mut percents = Vec::new();
     let mut reset_hours = Vec::new();
     push_grid_source_label(&mut percents, &mut reset_hours, &state.cc, state.now);
@@ -110,6 +111,7 @@ pub fn format_tray_label(state: &TrayDisplayState) -> String {
 }
 
 pub fn format_tray_tooltip(state: &TrayDisplayState) -> String {
+    let state = display_ready_state(state);
     let mut parts = Vec::new();
     push_source_label(&mut parts, &state.cc, state.now);
     push_source_label(&mut parts, &state.cx, state.now);
@@ -160,11 +162,12 @@ pub fn update_main_tray<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &TrayDisplayState,
 ) -> tauri::Result<()> {
-    store_latest_display_state(state);
-    let title = format_tray_label(state);
-    let tooltip = format_tray_tooltip(state);
+    let state = display_ready_state(state);
+    store_latest_display_state(&state);
+    let title = format_tray_label(&state);
+    let tooltip = format_tray_tooltip(&state);
     crate::native_status::update_title(app, title, tooltip);
-    crate::native_status::update_popover(app, native_popover_state_from_tray_state(state));
+    crate::native_status::update_popover(app, native_popover_state_from_tray_state(&state));
     Ok(())
 }
 
@@ -193,6 +196,12 @@ fn store_latest_display_state(state: &TrayDisplayState) {
     if let Ok(mut latest) = latest.lock() {
         *latest = state.clone();
     }
+}
+
+fn display_ready_state(state: &TrayDisplayState) -> TrayDisplayState {
+    let mut state = state.clone();
+    apply_claude_local_history_fallback(&mut state, &HiddenConfig::load());
+    state
 }
 
 pub fn apply_claude_local_history_fallback(
@@ -259,6 +268,7 @@ fn native_popover_state() -> NativePopoverState {
 }
 
 fn native_popover_state_from_tray_state(state: &TrayDisplayState) -> NativePopoverState {
+    let state = display_ready_state(state);
     let (rollup_day, rollup_week, rollup_month) = rollup_totals()
         .map(|(day, week, month)| {
             (
@@ -291,23 +301,18 @@ fn native_popover_source(source: &SourceTrayState, now: DateTime<Utc>) -> Native
         UsageSource::Codex => "Codex",
     };
     let percent = source.percent_used.unwrap_or(0);
-    let percent_text = source
-        .percent_used
-        .map(|value| format!("{value}%"))
-        .unwrap_or_else(|| {
-            source
-                .status_message
-                .clone()
-                .unwrap_or_else(|| "--".to_string())
-        });
+    let percent_text = source_percent_text(source);
     let reset_text = source
         .reset_at
         .map(|reset_at| format!("다음 갱신까지 {}", format_countdown(now, reset_at)))
         .unwrap_or_else(|| {
-            source
-                .status_message
-                .clone()
-                .unwrap_or_else(|| "다음 갱신까지 --".to_string())
+            source.status_message.clone().unwrap_or_else(|| {
+                if source.source == UsageSource::ClaudeCode {
+                    "로컬 기록 없음".to_string()
+                } else {
+                    "다음 갱신까지 --".to_string()
+                }
+            })
         });
 
     NativePopoverSourceState {
@@ -357,14 +362,14 @@ fn push_grid_source_label(
     if !source.enabled {
         return;
     }
-    if source.source == UsageSource::Codex && source.percent_used.is_none() {
+    if source.percent_used.is_none() {
         return;
     }
 
     let percent = source
         .percent_used
         .map(|value| format!("{value}%"))
-        .unwrap_or_else(|| "--%".to_string());
+        .expect("percent exists after guard");
     let estimate = if source.estimated { "~" } else { "" };
     percents.push(fixed_grid_cell(&format!("{estimate}{percent}")));
     reset_hours.push(fixed_grid_cell(
@@ -373,6 +378,20 @@ fn push_grid_source_label(
             .map(|reset_at| format_reset_hours(now, reset_at))
             .unwrap_or_else(|| "--h".to_string()),
     ));
+}
+
+fn source_percent_text(source: &SourceTrayState) -> String {
+    source
+        .percent_used
+        .map(|value| format!("{value}%"))
+        .or_else(|| source.status_message.clone())
+        .unwrap_or_else(|| {
+            if source.source == UsageSource::ClaudeCode {
+                "로컬 기록 없음".to_string()
+            } else {
+                "--".to_string()
+            }
+        })
 }
 
 fn push_source_label(parts: &mut Vec<String>, source: &SourceTrayState, now: DateTime<Utc>) {
