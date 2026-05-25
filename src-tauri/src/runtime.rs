@@ -134,6 +134,12 @@ fn apply_live_claude_rate_limit(
         tray_state.cc.percent_used = Some(status.remaining_percent);
         tray_state.cc.reset_at = Some(status.reset_at);
         tray_state.cc.estimated = false;
+        tray_state.cc.status_source = Some("official_observation".to_string());
+        tray_state.cc.status_message = Some(if status.remaining_percent == 0 {
+            "남은 토큰 없음".to_string()
+        } else {
+            "공식 확인".to_string()
+        });
     }
 }
 
@@ -282,6 +288,30 @@ mod tests {
             Some("official_observation")
         );
         assert_eq!(state.cx.status_message.as_deref(), Some("공식 확인"));
+    }
+
+    #[test]
+    fn exhausted_claude_observation_displays_zero_remaining() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
+        let mut state = TrayDisplayState::empty(now);
+        apply_live_claude_rate_limit(
+            &mut state,
+            Some(ClaudeRateLimitStatus {
+                used_percent: 100,
+                remaining_percent: 0,
+                reset_at: now + Duration::hours(2),
+                window_minutes: 300,
+            }),
+        );
+
+        assert_eq!(state.cc.percent_used, Some(0));
+        assert_eq!(state.cc.reset_at, Some(now + Duration::hours(2)));
+        assert!(!state.cc.estimated);
+        assert_eq!(
+            state.cc.status_source.as_deref(),
+            Some("official_observation")
+        );
+        assert_eq!(state.cc.status_message.as_deref(), Some("남은 토큰 없음"));
     }
 
     #[test]

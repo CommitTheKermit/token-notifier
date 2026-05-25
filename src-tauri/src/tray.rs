@@ -69,7 +69,7 @@ impl TrayDisplayState {
                 UsageSource::ClaudeCode => &mut state.cc,
                 UsageSource::Codex => continue,
             };
-            target.percent_used = Some(snapshot.percent_used);
+            target.percent_used = Some(100u8.saturating_sub(snapshot.percent_used));
             target.reset_at = Some(snapshot.reset_at);
             target.estimated = snapshot.estimated;
             target.status_source = Some(
@@ -471,5 +471,25 @@ mod tests {
         assert_eq!(state.cx.percent_used, None);
         assert_eq!(state.cx.reset_at, None);
         assert_eq!(state.cx.status_source.as_deref(), Some("unavailable"));
+    }
+
+    #[test]
+    fn claude_local_estimator_displays_remaining_percent() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
+        let snapshot = UsageSnapshot {
+            source: UsageSource::ClaudeCode,
+            window_id: "cc-local".to_string(),
+            window_start: now,
+            reset_at: now + Duration::hours(1),
+            tokens_used: 1_000_000,
+            quota_tokens: 1_000_000,
+            percent_used: 100,
+            estimated: true,
+        };
+
+        let state = TrayDisplayState::from_snapshots(&[snapshot], now);
+
+        assert_eq!(state.cc.percent_used, Some(0));
+        assert!(state.cc.estimated);
     }
 }
