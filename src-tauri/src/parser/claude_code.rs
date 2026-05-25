@@ -13,6 +13,7 @@ use std::time::{Duration as StdDuration, SystemTime};
 
 const PARSER_NAME: &str = "claude_code";
 const INITIALIZED_KEY: &str = "__initialized";
+const CLAUDE_PRIMARY_WINDOW_MINUTES: u64 = 300;
 const RATE_LIMIT_FETCH_TTL: StdDuration = StdDuration::from_secs(120);
 const RATE_LIMIT_STALE_TTL: chrono::Duration = chrono::Duration::minutes(15);
 const CLAUDE_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -319,6 +320,15 @@ fn fetch_rate_limit_status() -> anyhow::Result<Option<ClaudeRateLimitStatus>> {
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("Content-Type", "application/json")
         .send()?;
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Ok(rate_limited_status_from_retry_after(
+            response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Utc::now(),
+        ));
+    }
     if !response.status().is_success() {
         return Ok(None);
     }
@@ -392,8 +402,12 @@ fn parse_usage_api_response(
     response: &ClaudeUsageApiResponse,
     now: DateTime<Utc>,
 ) -> Option<ClaudeRateLimitStatus> {
-    parse_usage_window(response.five_hour.as_ref(), 300, now)
-        .or_else(|| parse_usage_window(response.seven_day.as_ref(), 7 * 24 * 60, now))
+    parse_usage_window(
+        response.five_hour.as_ref(),
+        CLAUDE_PRIMARY_WINDOW_MINUTES,
+        now,
+    )
+    .or_else(|| parse_usage_window(response.seven_day.as_ref(), 7 * 24 * 60, now))
 }
 
 fn parse_usage_window(
@@ -417,6 +431,36 @@ fn parse_usage_window(
         reset_at,
         window_minutes,
     })
+}
+
+fn rate_limited_status_from_retry_after(
+    retry_after: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<ClaudeRateLimitStatus> {
+    let reset_at = parse_retry_after(retry_after?, now)?;
+    if reset_at <= now {
+        return None;
+    }
+    Some(ClaudeRateLimitStatus {
+        used_percent: 100,
+        remaining_percent: 0,
+        reset_at,
+        window_minutes: CLAUDE_PRIMARY_WINDOW_MINUTES,
+    })
+}
+
+fn parse_retry_after(raw: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = raw.parse::<i64>() {
+        return Some(now + chrono::Duration::seconds(seconds.max(0)));
+    }
+    DateTime::parse_from_rfc2822(raw)
+        .or_else(|_| DateTime::parse_from_rfc3339(raw))
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
 }
 
 fn rounded_percent(value: f64) -> u8 {
@@ -557,6 +601,37 @@ mod tests {
         assert_eq!(status.remaining_percent, 79);
         assert_eq!(status.window_minutes, 300);
         assert_eq!(status.reset_at.timestamp(), reset_at.timestamp());
+    }
+
+    #[test]
+    fn treats_usage_endpoint_429_retry_after_as_exhausted() {
+        let now = DateTime::parse_from_rfc3339("2026-05-25T01:46:25Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let status = rate_limited_status_from_retry_after(Some("3141"), now).expect("status");
+
+        assert_eq!(status.used_percent, 100);
+        assert_eq!(status.remaining_percent, 0);
+        assert_eq!(status.window_minutes, 300);
+        assert_eq!(status.reset_at, now + Duration::seconds(3141));
+    }
+
+    #[test]
+    fn parses_retry_after_http_date() {
+        let now = DateTime::parse_from_rfc3339("2026-05-25T01:46:25Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let reset_at =
+            parse_retry_after("Mon, 25 May 2026 02:38:46 GMT", now).expect("retry-after date");
+
+        assert_eq!(
+            reset_at,
+            DateTime::parse_from_rfc3339("2026-05-25T02:38:46Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
     }
 
     #[test]
