@@ -1,6 +1,8 @@
+use crate::config::{database_path, HiddenConfig};
 use crate::parser::UsageSource;
+use crate::storage::{HourlyPoint, UsageStore};
 use crate::window_estimator::UsageSnapshot;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
 use tauri::{App, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -119,7 +121,8 @@ pub fn format_tray_tooltip(state: &TrayDisplayState) -> String {
 }
 
 pub fn build_main_tray(app: &App) -> tauri::Result<()> {
-    let initial_state = TrayDisplayState::empty(Utc::now());
+    let mut initial_state = TrayDisplayState::empty(Utc::now());
+    apply_claude_local_history_fallback(&mut initial_state, &HiddenConfig::load());
     store_latest_display_state(&initial_state);
     let initial_title = format_tray_label(&initial_state);
     let initial_tooltip = format_tray_tooltip(&initial_state);
@@ -166,10 +169,12 @@ pub fn update_main_tray<R: tauri::Runtime>(
 }
 
 pub fn latest_display_state() -> TrayDisplayState {
-    LAST_DISPLAY_STATE
+    let mut state = LAST_DISPLAY_STATE
         .get()
         .and_then(|state| state.lock().ok().map(|state| state.clone()))
-        .unwrap_or_else(|| TrayDisplayState::empty(Utc::now()))
+        .unwrap_or_else(|| TrayDisplayState::empty(Utc::now()));
+    apply_claude_local_history_fallback(&mut state, &HiddenConfig::load());
+    state
 }
 
 pub fn open_settings_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
@@ -188,6 +193,65 @@ fn store_latest_display_state(state: &TrayDisplayState) {
     if let Ok(mut latest) = latest.lock() {
         *latest = state.clone();
     }
+}
+
+pub fn apply_claude_local_history_fallback(
+    tray_state: &mut TrayDisplayState,
+    config: &HiddenConfig,
+) {
+    if tray_state.cc.percent_used.is_some() {
+        return;
+    }
+    let Some(db_path) = database_path() else {
+        return;
+    };
+    let Ok(store) = UsageStore::open(db_path) else {
+        return;
+    };
+    let Ok(points) = store.get_24h_series(tray_state.now) else {
+        return;
+    };
+    apply_claude_local_history_points(tray_state, config, &points);
+}
+
+fn apply_claude_local_history_points(
+    tray_state: &mut TrayDisplayState,
+    config: &HiddenConfig,
+    points: &[HourlyPoint],
+) {
+    if tray_state.cc.percent_used.is_some() {
+        return;
+    }
+    let window_secs = config.default_window_secs.max(60);
+    let Ok(window_secs_i64) = i64::try_from(window_secs) else {
+        return;
+    };
+    let start = tray_state.now - ChronoDuration::seconds(window_secs_i64);
+    let mut tokens_used = 0u64;
+    let mut earliest_hour: Option<DateTime<Utc>> = None;
+    for point in points
+        .iter()
+        .filter(|point| point.source == UsageSource::ClaudeCode && point.hour_start >= start)
+    {
+        tokens_used = tokens_used.saturating_add(point.tokens_used);
+        earliest_hour = Some(
+            earliest_hour
+                .map(|current| current.min(point.hour_start))
+                .unwrap_or(point.hour_start),
+        );
+    }
+    if tokens_used == 0 {
+        return;
+    }
+
+    let quota = config.quota_for(UsageSource::ClaudeCode).max(1);
+    let used_percent = ((tokens_used.saturating_mul(100)) / quota).min(100) as u8;
+    tray_state.cc.percent_used = Some(100u8.saturating_sub(used_percent));
+    tray_state.cc.reset_at =
+        earliest_hour.map(|hour| hour + ChronoDuration::seconds(window_secs_i64));
+    tray_state.cc.estimated = true;
+    tray_state.cc.status_source = Some("local_history".to_string());
+    tray_state.cc.status_message = Some("로컬 기록 기반 추정".to_string());
 }
 
 fn native_popover_state() -> NativePopoverState {
@@ -491,5 +555,53 @@ mod tests {
 
         assert_eq!(state.cc.percent_used, Some(0));
         assert!(state.cc.estimated);
+    }
+
+    #[test]
+    fn local_history_fallback_displays_zero_remaining_when_exhausted() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 21, 10, 30, 0).unwrap();
+        let mut state = TrayDisplayState::empty(now);
+        let config = HiddenConfig {
+            default_window_secs: 5 * 60 * 60,
+            cc_quota_tokens: 1_000,
+            cx_quota_tokens: 1_000,
+        };
+        let points = vec![HourlyPoint {
+            source: UsageSource::ClaudeCode,
+            hour_start: Utc.with_ymd_and_hms(2026, 5, 21, 9, 0, 0).unwrap(),
+            tokens_used: 1_500,
+        }];
+
+        apply_claude_local_history_points(&mut state, &config, &points);
+
+        assert_eq!(state.cc.percent_used, Some(0));
+        assert_eq!(
+            state.cc.reset_at,
+            Some(Utc.with_ymd_and_hms(2026, 5, 21, 14, 0, 0).unwrap())
+        );
+        assert_eq!(format_tray_label(&state), "   ~0%\n  3.5h");
+        assert!(state.cc.estimated);
+        assert_eq!(state.cc.status_source.as_deref(), Some("local_history"));
+        assert_eq!(
+            state.cc.status_message.as_deref(),
+            Some("로컬 기록 기반 추정")
+        );
+    }
+
+    #[test]
+    fn local_history_fallback_does_not_override_live_claude_status() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 21, 10, 30, 0).unwrap();
+        let mut state = TrayDisplayState::empty(now);
+        state.cc.percent_used = Some(42);
+        let config = HiddenConfig::default();
+        let points = vec![HourlyPoint {
+            source: UsageSource::ClaudeCode,
+            hour_start: Utc.with_ymd_and_hms(2026, 5, 21, 9, 0, 0).unwrap(),
+            tokens_used: 1_500_000,
+        }];
+
+        apply_claude_local_history_points(&mut state, &config, &points);
+
+        assert_eq!(state.cc.percent_used, Some(42));
     }
 }
