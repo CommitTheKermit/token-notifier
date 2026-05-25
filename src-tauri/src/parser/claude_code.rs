@@ -16,6 +16,7 @@ const INITIALIZED_KEY: &str = "__initialized";
 const CLAUDE_PRIMARY_WINDOW_MINUTES: u64 = 300;
 const RATE_LIMIT_FETCH_TTL: StdDuration = StdDuration::from_secs(120);
 const RATE_LIMIT_STALE_TTL: chrono::Duration = chrono::Duration::minutes(15);
+const RATE_LIMIT_CACHE_VERSION: u8 = 2;
 const CLAUDE_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 
 static RATE_LIMIT_CACHE: OnceLock<Mutex<RateLimitMemoryCache>> = OnceLock::new();
@@ -302,6 +303,8 @@ struct UsageWindow {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ClaudeRateLimitCacheFile {
+    #[serde(default)]
+    format_version: u8,
     timestamp: DateTime<Utc>,
     status: ClaudeRateLimitStatus,
 }
@@ -321,13 +324,7 @@ fn fetch_rate_limit_status() -> anyhow::Result<Option<ClaudeRateLimitStatus>> {
         .header("Content-Type", "application/json")
         .send()?;
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Ok(rate_limited_status_from_retry_after(
-            response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok()),
-            Utc::now(),
-        ));
+        return Ok(None);
     }
     if !response.status().is_success() {
         return Ok(None);
@@ -433,36 +430,6 @@ fn parse_usage_window(
     })
 }
 
-fn rate_limited_status_from_retry_after(
-    retry_after: Option<&str>,
-    now: DateTime<Utc>,
-) -> Option<ClaudeRateLimitStatus> {
-    let reset_at = parse_retry_after(retry_after?, now)?;
-    if reset_at <= now {
-        return None;
-    }
-    Some(ClaudeRateLimitStatus {
-        used_percent: 100,
-        remaining_percent: 0,
-        reset_at,
-        window_minutes: CLAUDE_PRIMARY_WINDOW_MINUTES,
-    })
-}
-
-fn parse_retry_after(raw: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    if let Ok(seconds) = raw.parse::<i64>() {
-        return Some(now + chrono::Duration::seconds(seconds.max(0)));
-    }
-    DateTime::parse_from_rfc2822(raw)
-        .or_else(|_| DateTime::parse_from_rfc3339(raw))
-        .ok()
-        .map(|value| value.with_timezone(&Utc))
-}
-
 fn rounded_percent(value: f64) -> u8 {
     let normalized = if (0.0..=1.0).contains(&value) {
         value * 100.0
@@ -481,6 +448,9 @@ fn latest_cached_rate_limit_status() -> Option<ClaudeRateLimitStatus> {
 fn read_cached_rate_limit_status(path: &Path) -> Option<ClaudeRateLimitStatus> {
     let raw = fs::read_to_string(path).ok()?;
     let cache = serde_json::from_str::<ClaudeRateLimitCacheFile>(&raw).ok()?;
+    if cache.format_version != RATE_LIMIT_CACHE_VERSION {
+        return None;
+    }
     let now = Utc::now();
     if cache.status.reset_at <= now || now - cache.timestamp > RATE_LIMIT_STALE_TTL {
         return None;
@@ -496,6 +466,7 @@ fn write_cached_rate_limit_status(status: &ClaudeRateLimitStatus) -> anyhow::Res
         fs::create_dir_all(parent)?;
     }
     let cache = ClaudeRateLimitCacheFile {
+        format_version: RATE_LIMIT_CACHE_VERSION,
         timestamp: Utc::now(),
         status: status.clone(),
     };
@@ -604,34 +575,51 @@ mod tests {
     }
 
     #[test]
-    fn treats_usage_endpoint_429_retry_after_as_exhausted() {
-        let now = DateTime::parse_from_rfc3339("2026-05-25T01:46:25Z")
-            .unwrap()
-            .with_timezone(&Utc);
+    fn ignores_legacy_retry_after_rate_limit_cache() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("claude-rate-limit.json");
+        let now = Utc::now();
+        fs::write(
+            &path,
+            serde_json::json!({
+                "timestamp": now,
+                "status": {
+                    "used_percent": 100,
+                    "remaining_percent": 0,
+                    "reset_at": now + Duration::minutes(30),
+                    "window_minutes": 300
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
 
-        let status = rate_limited_status_from_retry_after(Some("3141"), now).expect("status");
-
-        assert_eq!(status.used_percent, 100);
-        assert_eq!(status.remaining_percent, 0);
-        assert_eq!(status.window_minutes, 300);
-        assert_eq!(status.reset_at, now + Duration::seconds(3141));
+        assert_eq!(read_cached_rate_limit_status(&path), None);
     }
 
     #[test]
-    fn parses_retry_after_http_date() {
-        let now = DateTime::parse_from_rfc3339("2026-05-25T01:46:25Z")
-            .unwrap()
-            .with_timezone(&Utc);
+    fn reads_versioned_claude_rate_limit_cache() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("claude-rate-limit.json");
+        let now = Utc::now();
+        fs::write(
+            &path,
+            serde_json::json!({
+                "format_version": RATE_LIMIT_CACHE_VERSION,
+                "timestamp": now,
+                "status": {
+                    "used_percent": 21,
+                    "remaining_percent": 79,
+                    "reset_at": now + Duration::hours(4),
+                    "window_minutes": 300
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
 
-        let reset_at =
-            parse_retry_after("Mon, 25 May 2026 02:38:46 GMT", now).expect("retry-after date");
-
-        assert_eq!(
-            reset_at,
-            DateTime::parse_from_rfc3339("2026-05-25T02:38:46Z")
-                .unwrap()
-                .with_timezone(&Utc)
-        );
+        let status = read_cached_rate_limit_status(&path).expect("status");
+        assert_eq!(status.remaining_percent, 79);
     }
 
     #[test]
