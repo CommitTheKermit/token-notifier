@@ -1,7 +1,7 @@
 use super::{LocalLogParser, UsageEvent, UsageSource};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Number, Value};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -19,6 +19,9 @@ const RATE_LIMIT_FETCH_TTL: StdDuration = StdDuration::from_secs(120);
 const RATE_LIMIT_STALE_TTL: chrono::Duration = chrono::Duration::minutes(15);
 const RATE_LIMIT_CACHE_VERSION: u8 = 2;
 const CLAUDE_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_OAUTH_TOKEN_ENDPOINT: &str = "https://console.anthropic.com/v1/oauth/token";
+const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_CODE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
 static RATE_LIMIT_CACHE: OnceLock<Mutex<RateLimitMemoryCache>> = OnceLock::new();
 
@@ -325,18 +328,18 @@ fn effective_usage_tokens(usage: &Value) -> u64 {
     direct_tokens.saturating_add(cache_read / CACHE_READ_TOKEN_WEIGHT_DIVISOR)
 }
 
-#[derive(Debug, Deserialize)]
-struct OAuthCredentialsFile {
-    #[serde(rename = "claudeAiOauth")]
-    claude_ai_oauth: Option<OAuthCredentials>,
-    #[serde(flatten)]
-    flat: OAuthCredentials,
+#[derive(Debug)]
+struct StoredOAuthCredentials {
+    access_token: String,
+    refresh_token: Option<String>,
+    value: Value,
+    storage: OAuthCredentialStorage,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct OAuthCredentials {
-    #[serde(rename = "accessToken")]
-    access_token: Option<String>,
+#[derive(Debug)]
+enum OAuthCredentialStorage {
+    Keychain { account: Option<String> },
+    File { path: PathBuf },
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,14 +362,55 @@ struct ClaudeRateLimitCacheFile {
     status: ClaudeRateLimitStatus,
 }
 
+#[derive(Debug, Serialize)]
+struct OAuthRefreshRequest<'a> {
+    grant_type: &'static str,
+    refresh_token: &'a str,
+    client_id: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthRefreshResponse {
+    access_token: String,
+    refresh_token: String,
+    #[serde(default)]
+    expires_in: Option<i64>,
+}
+
+enum UsageFetchResult {
+    Status(Option<ClaudeRateLimitStatus>),
+    RateLimited,
+}
+
 fn fetch_rate_limit_status() -> anyhow::Result<Option<ClaudeRateLimitStatus>> {
-    let Some(access_token) = read_oauth_access_token() else {
+    let Some(mut credentials) = read_oauth_credentials() else {
         return Ok(None);
     };
 
     let client = reqwest::blocking::Client::builder()
         .timeout(StdDuration::from_secs(10))
         .build()?;
+
+    match fetch_usage_status(&client, &credentials.access_token)? {
+        UsageFetchResult::Status(status) => Ok(status),
+        UsageFetchResult::RateLimited => {
+            let Some(refresh_token) = credentials.refresh_token.clone() else {
+                return Ok(None);
+            };
+            let refreshed = refresh_oauth_tokens(&client, &refresh_token)?;
+            update_and_save_oauth_credentials(&mut credentials, refreshed)?;
+            match fetch_usage_status(&client, &credentials.access_token)? {
+                UsageFetchResult::Status(status) => Ok(status),
+                UsageFetchResult::RateLimited => Ok(None),
+            }
+        }
+    }
+}
+
+fn fetch_usage_status(
+    client: &reqwest::blocking::Client,
+    access_token: &str,
+) -> anyhow::Result<UsageFetchResult> {
     let response = client
         .get(CLAUDE_USAGE_ENDPOINT)
         .bearer_auth(access_token)
@@ -374,22 +418,112 @@ fn fetch_rate_limit_status() -> anyhow::Result<Option<ClaudeRateLimitStatus>> {
         .header("Content-Type", "application/json")
         .send()?;
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Ok(None);
+        return Ok(UsageFetchResult::RateLimited);
     }
     if !response.status().is_success() {
-        return Ok(None);
+        return Ok(UsageFetchResult::Status(None));
     }
     let usage = response.json::<ClaudeUsageApiResponse>()?;
-    Ok(parse_usage_api_response(&usage, Utc::now()))
+    Ok(UsageFetchResult::Status(parse_usage_api_response(
+        &usage,
+        Utc::now(),
+    )))
 }
 
-fn read_oauth_access_token() -> Option<String> {
-    read_oauth_access_token_from_keychain()
-        .or_else(read_oauth_access_token_from_file)
-        .filter(|token| !token.trim().is_empty())
+fn refresh_oauth_tokens(
+    client: &reqwest::blocking::Client,
+    refresh_token: &str,
+) -> anyhow::Result<OAuthRefreshResponse> {
+    let response = client
+        .post(CLAUDE_OAUTH_TOKEN_ENDPOINT)
+        .header("Content-Type", "application/json")
+        .json(&OAuthRefreshRequest {
+            grant_type: "refresh_token",
+            refresh_token,
+            client_id: CLAUDE_OAUTH_CLIENT_ID,
+        })
+        .send()?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "Claude OAuth token refresh failed with {}",
+            response.status()
+        );
+    }
+    Ok(response.json::<OAuthRefreshResponse>()?)
 }
 
-fn read_oauth_access_token_from_keychain() -> Option<String> {
+fn update_and_save_oauth_credentials(
+    credentials: &mut StoredOAuthCredentials,
+    refreshed: OAuthRefreshResponse,
+) -> anyhow::Result<()> {
+    update_oauth_credentials_value(&mut credentials.value, &refreshed, Utc::now())?;
+    let raw = serde_json::to_string_pretty(&credentials.value)?;
+    match &credentials.storage {
+        OAuthCredentialStorage::Keychain { account } => {
+            write_oauth_credentials_to_keychain(&raw, account.as_deref())?;
+        }
+        OAuthCredentialStorage::File { path } => {
+            fs::write(path, raw)?;
+        }
+    }
+    credentials.access_token = refreshed.access_token;
+    credentials.refresh_token = Some(refreshed.refresh_token);
+    Ok(())
+}
+
+fn update_oauth_credentials_value(
+    value: &mut Value,
+    refreshed: &OAuthRefreshResponse,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let Some(object) = oauth_credentials_object_mut(value) else {
+        anyhow::bail!("Claude OAuth credentials are not a JSON object");
+    };
+    let existing_expires_at = object.get("expiresAt").cloned();
+    object.insert(
+        "accessToken".to_string(),
+        Value::String(refreshed.access_token.clone()),
+    );
+    object.insert(
+        "refreshToken".to_string(),
+        Value::String(refreshed.refresh_token.clone()),
+    );
+    if let Some(expires_at) =
+        refreshed_expires_at_value(existing_expires_at.as_ref(), refreshed.expires_in, now)
+    {
+        object.insert("expiresAt".to_string(), expires_at);
+    }
+    Ok(())
+}
+
+fn refreshed_expires_at_value(
+    existing: Option<&Value>,
+    expires_in: Option<i64>,
+    now: DateTime<Utc>,
+) -> Option<Value> {
+    let expires_in = expires_in?;
+    if expires_in < 0 {
+        return None;
+    }
+    let is_seconds = existing
+        .and_then(Value::as_i64)
+        .is_some_and(|value| value < 10_000_000_000);
+    let timestamp = if is_seconds {
+        now.timestamp().saturating_add(expires_in)
+    } else {
+        now.timestamp_millis()
+            .saturating_add(expires_in.saturating_mul(1000))
+    };
+    Some(Value::Number(Number::from(timestamp)))
+}
+
+fn read_oauth_credentials() -> Option<StoredOAuthCredentials> {
+    read_oauth_credentials_from_keychain()
+        .or_else(read_oauth_credentials_from_file)
+        .filter(|credentials| !credentials.access_token.trim().is_empty())
+}
+
+fn read_oauth_credentials_from_keychain() -> Option<StoredOAuthCredentials> {
     #[cfg(not(target_os = "macos"))]
     {
         None
@@ -410,7 +544,7 @@ fn read_oauth_access_token_from_keychain() -> Option<String> {
                 .arg("find-generic-password")
                 .arg("-s")
                 .arg("Claude Code-credentials");
-            if let Some(account) = account {
+            if let Some(account) = account.as_deref() {
                 command.arg("-a").arg(account);
             }
             command.arg("-w");
@@ -423,26 +557,85 @@ fn read_oauth_access_token_from_keychain() -> Option<String> {
             let Ok(raw) = String::from_utf8(output.stdout) else {
                 continue;
             };
-            if let Some(token) = parse_oauth_access_token(&raw) {
-                return Some(token);
+            if let Some(credentials) =
+                parse_stored_oauth_credentials(&raw, OAuthCredentialStorage::Keychain { account })
+            {
+                return Some(credentials);
             }
         }
         None
     }
 }
 
-fn read_oauth_access_token_from_file() -> Option<String> {
+fn read_oauth_credentials_from_file() -> Option<StoredOAuthCredentials> {
     let path = dirs::home_dir()?.join(".claude").join(".credentials.json");
-    let raw = fs::read_to_string(path).ok()?;
-    parse_oauth_access_token(&raw)
+    let raw = fs::read_to_string(&path).ok()?;
+    parse_stored_oauth_credentials(&raw, OAuthCredentialStorage::File { path })
 }
 
-fn parse_oauth_access_token(raw: &str) -> Option<String> {
-    let parsed = serde_json::from_str::<OAuthCredentialsFile>(raw).ok()?;
-    parsed
-        .claude_ai_oauth
-        .and_then(|credentials| credentials.access_token)
-        .or(parsed.flat.access_token)
+fn parse_stored_oauth_credentials(
+    raw: &str,
+    storage: OAuthCredentialStorage,
+) -> Option<StoredOAuthCredentials> {
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    let access_token = oauth_credentials_object(&value)?
+        .get("accessToken")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_string();
+    let refresh_token = oauth_credentials_object(&value)?
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string);
+    Some(StoredOAuthCredentials {
+        access_token,
+        refresh_token,
+        value,
+        storage,
+    })
+}
+
+fn oauth_credentials_object(value: &Value) -> Option<&serde_json::Map<String, Value>> {
+    value
+        .get("claudeAiOauth")
+        .and_then(Value::as_object)
+        .or_else(|| value.as_object())
+}
+
+fn oauth_credentials_object_mut(value: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    if value
+        .get("claudeAiOauth")
+        .is_some_and(|oauth| oauth.is_object())
+    {
+        return value.get_mut("claudeAiOauth")?.as_object_mut();
+    }
+    value.as_object_mut()
+}
+
+#[cfg(target_os = "macos")]
+fn write_oauth_credentials_to_keychain(raw: &str, account: Option<&str>) -> anyhow::Result<()> {
+    let mut command = Command::new("/usr/bin/security");
+    command
+        .arg("add-generic-password")
+        .arg("-U")
+        .arg("-s")
+        .arg(CLAUDE_CODE_KEYCHAIN_SERVICE);
+    if let Some(account) = account {
+        command.arg("-a").arg(account);
+    }
+    command.arg("-w").arg(raw);
+    let output = command.output()?;
+    if !output.status.success() {
+        anyhow::bail!("failed to update Claude Code credentials in Keychain");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_oauth_credentials_to_keychain(_raw: &str, _account: Option<&str>) -> anyhow::Result<()> {
+    anyhow::bail!("Keychain credentials are only supported on macOS")
 }
 
 fn parse_usage_api_response(
@@ -656,6 +849,80 @@ mod tests {
         assert_eq!(status.remaining_percent, 79);
         assert_eq!(status.window_minutes, 300);
         assert_eq!(status.reset_at.timestamp(), reset_at.timestamp());
+    }
+
+    #[test]
+    fn parses_nested_claude_oauth_tokens() {
+        let raw = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": " access-token ",
+                "refreshToken": " refresh-token ",
+                "scopes": ["user:inference"]
+            },
+            "mcpOAuth": {
+                "accessToken": "mcp-token"
+            }
+        })
+        .to_string();
+
+        let credentials = parse_stored_oauth_credentials(
+            &raw,
+            OAuthCredentialStorage::File {
+                path: PathBuf::from("/tmp/credentials.json"),
+            },
+        )
+        .expect("credentials");
+
+        assert_eq!(credentials.access_token, "access-token");
+        assert_eq!(credentials.refresh_token, Some("refresh-token".into()));
+    }
+
+    #[test]
+    fn updates_nested_claude_oauth_tokens_without_dropping_other_fields() {
+        let mut value = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": 1_700_000_000_000i64,
+                "subscriptionType": "max"
+            },
+            "mcpOAuth": {
+                "accessToken": "mcp-token"
+            }
+        });
+        let refreshed = OAuthRefreshResponse {
+            access_token: "new-access".into(),
+            refresh_token: "new-refresh".into(),
+            expires_in: Some(3600),
+        };
+        let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("timestamp");
+
+        update_oauth_credentials_value(&mut value, &refreshed, now).expect("updated");
+
+        let oauth = value.get("claudeAiOauth").expect("oauth");
+        assert_eq!(
+            oauth.get("accessToken").and_then(Value::as_str),
+            Some("new-access")
+        );
+        assert_eq!(
+            oauth.get("refreshToken").and_then(Value::as_str),
+            Some("new-refresh")
+        );
+        assert_eq!(
+            oauth.get("expiresAt").and_then(Value::as_i64),
+            Some(1_700_003_600_000)
+        );
+        assert_eq!(
+            oauth.get("subscriptionType").and_then(Value::as_str),
+            Some("max")
+        );
+        assert_eq!(
+            value
+                .get("mcpOAuth")
+                .and_then(|mcp| mcp.get("accessToken"))
+                .and_then(Value::as_str),
+            Some("mcp-token")
+        );
     }
 
     #[test]
