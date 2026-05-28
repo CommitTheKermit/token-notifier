@@ -3,8 +3,8 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
@@ -22,6 +22,7 @@ const CLAUDE_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_OAUTH_TOKEN_ENDPOINT: &str = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_CODE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+const CLAUDE_OAUTH_DIAGNOSTIC_LOG: &str = "claude-oauth.log";
 
 static RATE_LIMIT_CACHE: OnceLock<Mutex<RateLimitMemoryCache>> = OnceLock::new();
 
@@ -333,6 +334,7 @@ struct StoredOAuthCredentials {
     access_token: String,
     refresh_token: Option<String>,
     value: Value,
+    encoding: OAuthCredentialEncoding,
     storage: OAuthCredentialStorage,
 }
 
@@ -340,6 +342,12 @@ struct StoredOAuthCredentials {
 enum OAuthCredentialStorage {
     Keychain { account: Option<String> },
     File { path: PathBuf },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthCredentialEncoding {
+    Json,
+    HexJson,
 }
 
 #[derive(Debug, Deserialize)]
@@ -379,11 +387,12 @@ struct OAuthRefreshResponse {
 
 enum UsageFetchResult {
     Status(Option<ClaudeRateLimitStatus>),
-    RateLimited,
+    NeedsRefresh(reqwest::StatusCode),
 }
 
 fn fetch_rate_limit_status() -> anyhow::Result<Option<ClaudeRateLimitStatus>> {
     let Some(mut credentials) = read_oauth_credentials() else {
+        log_claude_oauth_event("credentials unavailable; usage request skipped");
         return Ok(None);
     };
 
@@ -391,20 +400,93 @@ fn fetch_rate_limit_status() -> anyhow::Result<Option<ClaudeRateLimitStatus>> {
         .timeout(StdDuration::from_secs(10))
         .build()?;
 
-    match fetch_usage_status(&client, &credentials.access_token)? {
-        UsageFetchResult::Status(status) => Ok(status),
-        UsageFetchResult::RateLimited => {
-            let Some(refresh_token) = credentials.refresh_token.clone() else {
-                return Ok(None);
-            };
-            let refreshed = refresh_oauth_tokens(&client, &refresh_token)?;
-            update_and_save_oauth_credentials(&mut credentials, refreshed)?;
-            match fetch_usage_status(&client, &credentials.access_token)? {
-                UsageFetchResult::Status(status) => Ok(status),
-                UsageFetchResult::RateLimited => Ok(None),
-            }
+    log_claude_oauth_event("usage request started");
+    match fetch_usage_status(&client, &credentials.access_token) {
+        Ok(UsageFetchResult::Status(status)) => {
+            log_usage_fetch_status("usage request", status.as_ref());
+            Ok(status)
+        }
+        Ok(UsageFetchResult::NeedsRefresh(status)) => {
+            log_claude_oauth_event(format!(
+                "usage request returned {status}; attempting OAuth refresh"
+            ));
+            refresh_and_retry_usage_status(&client, &mut credentials)
+        }
+        Err(error) => {
+            log_claude_oauth_event(format!("usage request failed: {error:#}"));
+            Ok(None)
         }
     }
+}
+
+fn refresh_and_retry_usage_status(
+    client: &reqwest::blocking::Client,
+    credentials: &mut StoredOAuthCredentials,
+) -> anyhow::Result<Option<ClaudeRateLimitStatus>> {
+    let Some(refresh_token) = credentials.refresh_token.clone() else {
+        log_claude_oauth_event("OAuth refresh skipped; refresh token is unavailable");
+        return Ok(None);
+    };
+    let refreshed = match refresh_oauth_tokens(client, &refresh_token) {
+        Ok(refreshed) => {
+            log_claude_oauth_event("OAuth refresh succeeded; persisting replacement credentials");
+            refreshed
+        }
+        Err(error) => {
+            log_claude_oauth_event(format!("OAuth refresh failed: {error:#}"));
+            return Ok(None);
+        }
+    };
+    if let Err(error) = update_and_save_oauth_credentials(credentials, refreshed) {
+        log_claude_oauth_event(format!(
+            "credential persistence failed after refresh: {error:#}"
+        ));
+        return Ok(None);
+    }
+    log_claude_oauth_event("replacement credentials persisted; retrying usage request");
+    match fetch_usage_status(client, &credentials.access_token) {
+        Ok(UsageFetchResult::Status(status)) => {
+            log_usage_fetch_status("usage retry", status.as_ref());
+            Ok(status)
+        }
+        Ok(UsageFetchResult::NeedsRefresh(status)) => {
+            log_claude_oauth_event(format!("usage retry returned {status} after OAuth refresh"));
+            Ok(None)
+        }
+        Err(error) => {
+            log_claude_oauth_event(format!("usage retry failed after OAuth refresh: {error:#}"));
+            Ok(None)
+        }
+    }
+}
+
+fn log_usage_fetch_status(prefix: &str, status: Option<&ClaudeRateLimitStatus>) {
+    match status {
+        Some(status) => log_claude_oauth_event(format!(
+            "{prefix} succeeded; remaining={}%, used={}%, reset_at={}",
+            status.remaining_percent, status.used_percent, status.reset_at
+        )),
+        None => log_claude_oauth_event(format!("{prefix} returned no usable official status")),
+    }
+}
+
+fn log_claude_oauth_event(message: impl AsRef<str>) {
+    let timestamp = Utc::now().to_rfc3339();
+    let line = format!("{timestamp} {message}\n", message = message.as_ref());
+    eprint!("{line}");
+    let Some(path) = claude_oauth_diagnostic_log_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn claude_oauth_diagnostic_log_path() -> Option<PathBuf> {
+    crate::config::app_support_dir().map(|dir| dir.join(CLAUDE_OAUTH_DIAGNOSTIC_LOG))
 }
 
 fn fetch_usage_status(
@@ -417,10 +499,29 @@ fn fetch_usage_status(
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("Content-Type", "application/json")
         .send()?;
-    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Ok(UsageFetchResult::RateLimited);
+    let status = response.status();
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::TOO_MANY_REQUESTS
+    ) {
+        log_claude_oauth_event(format!(
+            "usage request returned refreshable HTTP {status}: {}",
+            summarize_http_body(response.text().unwrap_or_default())
+        ));
+        return Ok(UsageFetchResult::NeedsRefresh(status));
     }
-    if !response.status().is_success() {
+    if status == reqwest::StatusCode::FORBIDDEN {
+        log_claude_oauth_event(format!(
+            "usage request returned non-refreshable HTTP {status}; Claude Code /login may be required: {}",
+            summarize_http_body(response.text().unwrap_or_default())
+        ));
+        return Ok(UsageFetchResult::Status(None));
+    }
+    if !status.is_success() {
+        log_claude_oauth_event(format!(
+            "usage request returned HTTP {status}: {}",
+            summarize_http_body(response.text().unwrap_or_default())
+        ));
         return Ok(UsageFetchResult::Status(None));
     }
     let usage = response.json::<ClaudeUsageApiResponse>()?;
@@ -457,7 +558,7 @@ fn update_and_save_oauth_credentials(
     refreshed: OAuthRefreshResponse,
 ) -> anyhow::Result<()> {
     update_oauth_credentials_value(&mut credentials.value, &refreshed, Utc::now())?;
-    let raw = serde_json::to_string_pretty(&credentials.value)?;
+    let raw = encode_oauth_credentials_for_storage(&credentials.value, credentials.encoding)?;
     match &credentials.storage {
         OAuthCredentialStorage::Keychain { account } => {
             write_oauth_credentials_to_keychain(&raw, account.as_deref())?;
@@ -518,9 +619,21 @@ fn refreshed_expires_at_value(
 }
 
 fn read_oauth_credentials() -> Option<StoredOAuthCredentials> {
-    read_oauth_credentials_from_keychain()
-        .or_else(read_oauth_credentials_from_file)
-        .filter(|credentials| !credentials.access_token.trim().is_empty())
+    if let Some(credentials) = read_oauth_credentials_from_keychain() {
+        if !credentials.access_token.trim().is_empty() {
+            log_claude_oauth_event("credentials loaded from macOS Keychain");
+            return Some(credentials);
+        }
+        log_claude_oauth_event("macOS Keychain credentials had an empty access token");
+    }
+    if let Some(credentials) = read_oauth_credentials_from_file() {
+        if !credentials.access_token.trim().is_empty() {
+            log_claude_oauth_event("credentials loaded from ~/.claude/.credentials.json");
+            return Some(credentials);
+        }
+        log_claude_oauth_event("file credentials had an empty access token");
+    }
+    None
 }
 
 fn read_oauth_credentials_from_keychain() -> Option<StoredOAuthCredentials> {
@@ -539,22 +652,37 @@ fn read_oauth_credentials_from_keychain() -> Option<StoredOAuthCredentials> {
         candidates.push(None);
 
         for account in candidates {
+            let account_label = account
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| "<default>".to_string());
             let mut command = Command::new("/usr/bin/security");
             command
                 .arg("find-generic-password")
                 .arg("-s")
-                .arg("Claude Code-credentials");
+                .arg(CLAUDE_CODE_KEYCHAIN_SERVICE);
             if let Some(account) = account.as_deref() {
                 command.arg("-a").arg(account);
             }
             command.arg("-w");
             let Ok(output) = command.output() else {
+                log_claude_oauth_event(format!(
+                    "Keychain lookup command failed for account={account_label}"
+                ));
                 continue;
             };
             if !output.status.success() {
+                log_claude_oauth_event(format!(
+                    "Keychain lookup returned status={} for account={account_label}: {}",
+                    output.status,
+                    sanitized_command_stderr(&output.stderr)
+                ));
                 continue;
             }
             let Ok(raw) = String::from_utf8(output.stdout) else {
+                log_claude_oauth_event(format!(
+                    "Keychain lookup returned non-UTF8 credentials for account={account_label}"
+                ));
                 continue;
             };
             if let Some(credentials) =
@@ -562,6 +690,9 @@ fn read_oauth_credentials_from_keychain() -> Option<StoredOAuthCredentials> {
             {
                 return Some(credentials);
             }
+            log_claude_oauth_event(format!(
+                "Keychain credentials were present but did not contain Claude OAuth tokens for account={account_label}"
+            ));
         }
         None
     }
@@ -569,15 +700,49 @@ fn read_oauth_credentials_from_keychain() -> Option<StoredOAuthCredentials> {
 
 fn read_oauth_credentials_from_file() -> Option<StoredOAuthCredentials> {
     let path = dirs::home_dir()?.join(".claude").join(".credentials.json");
-    let raw = fs::read_to_string(&path).ok()?;
-    parse_stored_oauth_credentials(&raw, OAuthCredentialStorage::File { path })
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            log_claude_oauth_event(format!(
+                "file credential lookup failed at {}: {error}",
+                path.display()
+            ));
+            return None;
+        }
+    };
+    let credentials = parse_stored_oauth_credentials(&raw, OAuthCredentialStorage::File { path });
+    if credentials.is_none() {
+        log_claude_oauth_event(
+            "file credentials were present but did not contain Claude OAuth tokens",
+        );
+    }
+    credentials
+}
+
+fn sanitized_command_stderr(stderr: &[u8]) -> String {
+    let message = String::from_utf8_lossy(stderr);
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        "<empty stderr>".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn summarize_http_body(body: String) -> String {
+    let single_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.is_empty() {
+        "<empty body>".to_string()
+    } else {
+        single_line.chars().take(500).collect()
+    }
 }
 
 fn parse_stored_oauth_credentials(
     raw: &str,
     storage: OAuthCredentialStorage,
 ) -> Option<StoredOAuthCredentials> {
-    let value = serde_json::from_str::<Value>(raw).ok()?;
+    let (value, encoding) = parse_oauth_credentials_value(raw)?;
     let access_token = oauth_credentials_object(&value)?
         .get("accessToken")
         .and_then(Value::as_str)?
@@ -593,8 +758,50 @@ fn parse_stored_oauth_credentials(
         access_token,
         refresh_token,
         value,
+        encoding,
         storage,
     })
+}
+
+fn parse_oauth_credentials_value(raw: &str) -> Option<(Value, OAuthCredentialEncoding)> {
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        return Some((value, OAuthCredentialEncoding::Json));
+    }
+    let decoded = decode_hex_json(raw)?;
+    serde_json::from_str::<Value>(&decoded)
+        .ok()
+        .map(|value| (value, OAuthCredentialEncoding::HexJson))
+}
+
+fn encode_oauth_credentials_for_storage(
+    value: &Value,
+    encoding: OAuthCredentialEncoding,
+) -> anyhow::Result<String> {
+    let raw = serde_json::to_string_pretty(value)?;
+    Ok(match encoding {
+        OAuthCredentialEncoding::Json => raw,
+        OAuthCredentialEncoding::HexJson => encode_hex(raw.as_bytes()),
+    })
+}
+
+fn decode_hex_json(raw: &str) -> Option<String> {
+    let hex = raw.trim();
+    if hex.len() % 2 != 0 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let text = std::str::from_utf8(chunk).ok()?;
+            u8::from_str_radix(text, 16).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn oauth_credentials_object(value: &Value) -> Option<&serde_json::Map<String, Value>> {
@@ -875,6 +1082,51 @@ mod tests {
 
         assert_eq!(credentials.access_token, "access-token");
         assert_eq!(credentials.refresh_token, Some("refresh-token".into()));
+        assert_eq!(credentials.encoding, OAuthCredentialEncoding::Json);
+    }
+
+    #[test]
+    fn parses_hex_encoded_claude_oauth_tokens() {
+        let raw_json = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "access-token",
+                "refreshToken": "refresh-token"
+            }
+        })
+        .to_string();
+        let raw_hex = encode_hex(raw_json.as_bytes());
+
+        let credentials = parse_stored_oauth_credentials(
+            &raw_hex,
+            OAuthCredentialStorage::Keychain {
+                account: Some("user".into()),
+            },
+        )
+        .expect("credentials");
+
+        assert_eq!(credentials.access_token, "access-token");
+        assert_eq!(credentials.refresh_token, Some("refresh-token".into()));
+        assert_eq!(credentials.encoding, OAuthCredentialEncoding::HexJson);
+    }
+
+    #[test]
+    fn preserves_hex_encoding_when_saving_refreshed_tokens() {
+        let value = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "new-access",
+                "refreshToken": "new-refresh"
+            }
+        });
+
+        let encoded =
+            encode_oauth_credentials_for_storage(&value, OAuthCredentialEncoding::HexJson)
+                .expect("encoded");
+        let decoded = decode_hex_json(&encoded).expect("decoded");
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&decoded).expect("json"),
+            value
+        );
     }
 
     #[test]
