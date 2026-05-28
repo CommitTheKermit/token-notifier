@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 const LOCAL_ACCOUNTING_GENERATION_KEY: &str = "local_accounting_generation";
-const CURRENT_LOCAL_ACCOUNTING_GENERATION: &str = "4";
+const CURRENT_LOCAL_ACCOUNTING_GENERATION: &str = "5";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HourlyPoint {

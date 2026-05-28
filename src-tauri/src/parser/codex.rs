@@ -1,5 +1,5 @@
 use super::{parse_epoch_like_timestamp, LocalLogParser, UsageEvent, UsageSource};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -148,13 +148,34 @@ impl LocalLogParser for CodexParser {
         let rows = rows.collect::<Result<Vec<_>, _>>()?;
 
         if self.state_db_path.is_some() && !self.initialized {
-            for (thread_id, _updated_at, tokens_used) in rows {
+            let window_secs = crate::config::HiddenConfig::load()
+                .default_window_secs
+                .max(60);
+            let bootstrap_window_start = i64::try_from(window_secs)
+                .ok()
+                .map(|secs| Utc::now() - ChronoDuration::seconds(secs));
+            let mut events = Vec::new();
+            for (thread_id, updated_at, tokens_used) in rows {
+                let occurred_at =
+                    parse_epoch_like_timestamp(updated_at).unwrap_or_else(chrono::Utc::now);
+                if bootstrap_window_start
+                    .map(|window_start| occurred_at >= window_start)
+                    .unwrap_or(false)
+                {
+                    events.push(UsageEvent {
+                        source: UsageSource::Codex,
+                        event_id: format!("{thread_id}:{tokens_used}"),
+                        occurred_at,
+                        tokens: tokens_used,
+                        metadata: None,
+                    });
+                }
                 self.last_tokens_by_thread
                     .insert(thread_id.clone(), tokens_used);
                 self.save_thread_tokens(&thread_id, tokens_used)?;
             }
             self.mark_initialized()?;
-            return Ok(Vec::new());
+            return Ok(events);
         }
 
         let mut events = Vec::new();
@@ -343,7 +364,29 @@ mod tests {
         assert_eq!(events[0].tokens, 30);
     }
 
+    #[test]
+    fn initial_state_bootstraps_recent_codex_threads_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let codex_db = dir.path().join("state_5.sqlite");
+        let app_db = dir.path().join("usage.sqlite");
+        seed_thread_at(&codex_db, "thread-a", 100, Utc::now().timestamp());
+
+        let mut parser = CodexParser::from_db(codex_db.clone()).with_state_db_path(app_db.clone());
+        let events = parser.read_delta().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, UsageSource::Codex);
+        assert_eq!(events[0].tokens, 100);
+        assert!(parser.read_delta().unwrap().is_empty());
+
+        let mut restarted = CodexParser::from_db(codex_db).with_state_db_path(app_db);
+        assert!(restarted.read_delta().unwrap().is_empty());
+    }
+
     fn seed_thread(path: &PathBuf, id: &str, tokens: u64) {
+        seed_thread_at(path, id, tokens, 1779614100);
+    }
+
+    fn seed_thread_at(path: &PathBuf, id: &str, tokens: u64, updated_at: i64) {
         let conn = Connection::open(path).expect("open codex db");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS threads (
@@ -359,10 +402,10 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO threads (id, created_at, updated_at, cwd, tokens_used, model, reasoning_effort)
-             VALUES (?1, 1779614000, 1779614100, '/', ?2, NULL, NULL)
+             VALUES (?1, 1779614000, ?3, '/', ?2, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET tokens_used = excluded.tokens_used,
                                            updated_at = excluded.updated_at",
-            params![id, tokens as i64],
+            params![id, tokens as i64, updated_at],
         )
         .unwrap();
     }

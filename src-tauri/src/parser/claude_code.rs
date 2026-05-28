@@ -1,5 +1,5 @@
 use super::{LocalLogParser, UsageEvent, UsageSource};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -149,6 +149,34 @@ impl ClaudeCodeParser {
         Ok(events)
     }
 
+    fn read_file_bootstrap_window(
+        &mut self,
+        path: &Path,
+        window_start: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<UsageEvent>> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut events = Vec::new();
+        let mut line = String::new();
+
+        loop {
+            let line_offset = reader.stream_position()?;
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            if let Some(event) = parse_usage_line(path, line_offset, line.trim_end()) {
+                if event.occurred_at >= window_start {
+                    events.push(event);
+                }
+            }
+            line.clear();
+        }
+
+        let new_offset = reader.stream_position()?;
+        self.offsets.insert(path.to_path_buf(), new_offset);
+        self.save_offset(path, new_offset)?;
+        Ok(events)
+    }
+
     fn load_state_if_needed(&mut self) -> anyhow::Result<()> {
         if self.state_loaded {
             return Ok(());
@@ -200,12 +228,20 @@ impl LocalLogParser for ClaudeCodeParser {
         self.load_state_if_needed()?;
         let mut events = Vec::new();
         let should_baseline = self.state_db_path.is_some() && !self.initialized;
+        let bootstrap_window_start = if should_baseline {
+            let window_secs = crate::config::HiddenConfig::load()
+                .default_window_secs
+                .max(60);
+            i64::try_from(window_secs)
+                .ok()
+                .map(|secs| Utc::now() - ChronoDuration::seconds(secs))
+        } else {
+            None
+        };
         for path in self.discover_files() {
             if path.is_file() {
-                if should_baseline {
-                    let size = fs::metadata(&path)?.len();
-                    self.offsets.insert(path.clone(), size);
-                    self.save_offset(&path, size)?;
+                if let Some(window_start) = bootstrap_window_start {
+                    events.extend(self.read_file_bootstrap_window(&path, window_start)?);
                 } else {
                     events.extend(self.read_file_delta(&path)?);
                 }
@@ -213,7 +249,6 @@ impl LocalLogParser for ClaudeCodeParser {
         }
         if should_baseline {
             self.mark_initialized()?;
-            return Ok(Vec::new());
         }
         events.sort_by_key(|event| event.occurred_at);
         Ok(events)
@@ -569,6 +604,29 @@ mod tests {
     }
 
     #[test]
+    fn persisted_state_bootstraps_current_window_logs_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = dir.path().join("session.jsonl");
+        let db = dir.path().join("usage.sqlite");
+        append_usage_line_at(&log, 10, Utc::now());
+
+        let mut parser =
+            ClaudeCodeParser::from_files(vec![log.clone()]).with_state_db_path(db.clone());
+        let events = parser.read_delta().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tokens, 10);
+        assert!(parser.read_delta().unwrap().is_empty());
+
+        append_usage_line_at(&log, 7, Utc::now());
+        let events = parser.read_delta().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tokens, 7);
+
+        let mut restarted = ClaudeCodeParser::from_files(vec![log]).with_state_db_path(db);
+        assert!(restarted.read_delta().unwrap().is_empty());
+    }
+
+    #[test]
     fn uses_message_id_for_stable_deduplication() {
         let path = Path::new("/tmp/session.jsonl");
         let line = r#"{"type":"assistant","timestamp":"2026-05-21T01:01:24.096Z","message":{"id":"msg_123","usage":{"input_tokens":6,"output_tokens":3,"cache_creation_input_tokens":10,"cache_read_input_tokens":20}}}"#;
@@ -665,6 +723,16 @@ mod tests {
     }
 
     fn append_usage_line(path: &Path, output_tokens: u64) {
+        append_usage_line_at(
+            path,
+            output_tokens,
+            DateTime::parse_from_rfc3339("2026-05-21T01:01:24.096Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+    }
+
+    fn append_usage_line_at(path: &Path, output_tokens: u64, timestamp: DateTime<Utc>) {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -672,7 +740,8 @@ mod tests {
             .expect("open log");
         writeln!(
             file,
-            r#"{{"type":"assistant","timestamp":"2026-05-21T01:01:24.096Z","message":{{"usage":{{"output_tokens":{output_tokens}}}}}}}"#
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"usage":{{"output_tokens":{output_tokens}}}}}}}"#,
+            timestamp.to_rfc3339()
         )
         .unwrap();
     }
