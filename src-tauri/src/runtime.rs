@@ -118,7 +118,6 @@ fn publish_tray_state<R: tauri::Runtime>(
         ClaudeCodeParser::latest_rate_limit_status(),
     );
     apply_live_codex_rate_limit(&mut tray_state, CodexParser::latest_rate_limit_status());
-    crate::tray::apply_claude_local_history_fallback(&mut tray_state, &HiddenConfig::load());
     tray_state.cc.enabled = settings.claude_code.enabled;
     tray_state.cx.enabled = settings.codex.enabled;
     update_main_tray(app, &tray_state)?;
@@ -131,16 +130,25 @@ fn apply_live_claude_rate_limit(
     tray_state: &mut TrayDisplayState,
     status: Option<ClaudeRateLimitStatus>,
 ) {
-    if let Some(status) = status {
-        tray_state.cc.percent_used = Some(status.remaining_percent);
-        tray_state.cc.reset_at = Some(status.reset_at);
-        tray_state.cc.estimated = false;
-        tray_state.cc.status_source = Some("official_observation".to_string());
-        tray_state.cc.status_message = Some(if status.remaining_percent == 0 {
-            "남은 토큰 없음".to_string()
-        } else {
-            "공식 확인".to_string()
-        });
+    match status {
+        Some(status) => {
+            tray_state.cc.percent_used = Some(status.remaining_percent);
+            tray_state.cc.reset_at = Some(status.reset_at);
+            tray_state.cc.estimated = false;
+            tray_state.cc.status_source = Some("official_observation".to_string());
+            tray_state.cc.status_message = Some(if status.remaining_percent == 0 {
+                "남은 토큰 없음".to_string()
+            } else {
+                "공식 확인".to_string()
+            });
+        }
+        None => {
+            tray_state.cc.percent_used = None;
+            tray_state.cc.reset_at = None;
+            tray_state.cc.estimated = false;
+            tray_state.cc.status_source = Some("official_unavailable".to_string());
+            tray_state.cc.status_message = Some("공식 API 데이터 없음".to_string());
+        }
     }
 }
 
@@ -265,7 +273,7 @@ fn maybe_send_alert<R: tauri::Runtime>(
     if !settings.enabled {
         return Ok(());
     }
-    if snapshot.source == UsageSource::Codex && snapshot.estimated {
+    if snapshot.estimated {
         return Ok(());
     }
     if let Some(notification) = ThresholdEvaluator::evaluate(store, snapshot, &settings.thresholds)?
@@ -336,6 +344,29 @@ mod tests {
             Some("official_observation")
         );
         assert_eq!(state.cc.status_message.as_deref(), Some("남은 토큰 없음"));
+    }
+
+    #[test]
+    fn missing_claude_observation_reports_official_api_unavailable() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
+        let mut state = TrayDisplayState::empty(now);
+        state.cc.percent_used = Some(88);
+        state.cc.reset_at = Some(now + Duration::hours(4));
+        state.cc.estimated = true;
+
+        apply_live_claude_rate_limit(&mut state, None);
+
+        assert_eq!(state.cc.percent_used, None);
+        assert_eq!(state.cc.reset_at, None);
+        assert!(!state.cc.estimated);
+        assert_eq!(
+            state.cc.status_source.as_deref(),
+            Some("official_unavailable")
+        );
+        assert_eq!(
+            state.cc.status_message.as_deref(),
+            Some("공식 API 데이터 없음")
+        );
     }
 
     #[test]
