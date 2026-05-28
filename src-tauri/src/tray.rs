@@ -69,7 +69,7 @@ impl TrayDisplayState {
         for snapshot in snapshots {
             let target = match snapshot.source {
                 UsageSource::ClaudeCode => &mut state.cc,
-                UsageSource::Codex => continue,
+                UsageSource::Codex => &mut state.cx,
             };
             target.percent_used = Some(100u8.saturating_sub(snapshot.percent_used));
             target.reset_at = Some(snapshot.reset_at);
@@ -362,14 +362,10 @@ fn push_grid_source_label(
     if !source.enabled {
         return;
     }
-    if source.percent_used.is_none() {
-        return;
-    }
-
     let percent = source
         .percent_used
         .map(|value| format!("{value}%"))
-        .expect("percent exists after guard");
+        .unwrap_or_else(|| "--%".to_string());
     let estimate = if source.estimated { "~" } else { "" };
     percents.push(fixed_grid_cell(&format!("{estimate}{percent}")));
     reset_hours.push(fixed_grid_cell(
@@ -507,6 +503,18 @@ mod tests {
     }
 
     #[test]
+    fn format_tray_label_keeps_enabled_sources_visible_without_percent() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
+        let state = TrayDisplayState::empty(now);
+
+        assert_eq!(format_tray_label(&state), "   --%    --%\n   --h    --h");
+        assert_eq!(
+            format_tray_tooltip(&state),
+            "CC 데이터 없음  CX 공식 실시간 데이터 없음"
+        );
+    }
+
+    #[test]
     fn format_tray_label_keeps_constant_grid_width_across_digit_counts() {
         let now = Utc.with_ymd_and_hms(2026, 5, 23, 5, 0, 0).unwrap();
         let mut state = TrayDisplayState::empty(now);
@@ -537,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_local_estimator_snapshots_do_not_populate_tray_percent() {
+    fn codex_local_estimator_snapshots_populate_tray_percent() {
         let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
         let snapshot = UsageSnapshot {
             source: UsageSource::Codex,
@@ -551,9 +559,10 @@ mod tests {
         };
 
         let state = TrayDisplayState::from_snapshots(&[snapshot], now);
-        assert_eq!(state.cx.percent_used, None);
-        assert_eq!(state.cx.reset_at, None);
-        assert_eq!(state.cx.status_source.as_deref(), Some("unavailable"));
+        assert_eq!(state.cx.percent_used, Some(25));
+        assert_eq!(state.cx.reset_at, Some(now + Duration::hours(5)));
+        assert_eq!(state.cx.status_source.as_deref(), Some("local_estimate"));
+        assert!(state.cx.estimated);
     }
 
     #[test]
@@ -598,7 +607,7 @@ mod tests {
             state.cc.reset_at,
             Some(Utc.with_ymd_and_hms(2026, 5, 21, 14, 0, 0).unwrap())
         );
-        assert_eq!(format_tray_label(&state), "   ~0%\n  3.5h");
+        assert_eq!(format_tray_label(&state), "   ~0%    --%\n  3.5h    --h");
         assert!(state.cc.estimated);
         assert_eq!(state.cc.status_source.as_deref(), Some("local_history"));
         assert_eq!(

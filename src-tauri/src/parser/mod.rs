@@ -119,7 +119,7 @@ mod tests {
         let first = parser.read_delta().expect("first read");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].source, UsageSource::ClaudeCode);
-        assert_eq!(first[0].tokens, 39);
+        assert_eq!(first[0].tokens, 21);
         assert!(parser.read_delta().expect("second read").is_empty());
 
         let mut file = OpenOptions::new().append(true).open(&log).unwrap();

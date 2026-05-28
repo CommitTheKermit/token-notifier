@@ -14,6 +14,7 @@ use std::time::{Duration as StdDuration, SystemTime};
 const PARSER_NAME: &str = "claude_code";
 const INITIALIZED_KEY: &str = "__initialized";
 const CLAUDE_PRIMARY_WINDOW_MINUTES: u64 = 300;
+const CACHE_READ_TOKEN_WEIGHT_DIVISOR: u64 = 10;
 const RATE_LIMIT_FETCH_TTL: StdDuration = StdDuration::from_secs(120);
 const RATE_LIMIT_STALE_TTL: chrono::Duration = chrono::Duration::minutes(15);
 const RATE_LIMIT_CACHE_VERSION: u8 = 2;
@@ -244,20 +245,18 @@ fn parse_usage_line(path: &Path, line_offset: u64, line: &str) -> Option<UsageEv
         return None;
     }
 
-    let usage = value.get("message")?.get("usage")?;
-    let tokens = [
-        "input_tokens",
-        "output_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-    ]
-    .iter()
-    .filter_map(|key| usage.get(*key).and_then(Value::as_u64))
-    .sum::<u64>();
+    let message = value.get("message")?;
+    let usage = message.get("usage")?;
+    let tokens = effective_usage_tokens(usage);
 
     if tokens == 0 {
         return None;
     }
+    let event_id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|message_id| format!("{}:{message_id}", path.display()))
+        .unwrap_or_else(|| format!("{}:{line_offset}", path.display()));
 
     let occurred_at = value
         .get("timestamp")
@@ -268,11 +267,27 @@ fn parse_usage_line(path: &Path, line_offset: u64, line: &str) -> Option<UsageEv
 
     Some(UsageEvent {
         source: UsageSource::ClaudeCode,
-        event_id: format!("{}:{line_offset}", path.display()),
+        event_id,
         occurred_at,
         tokens,
         metadata: None,
     })
+}
+
+fn effective_usage_tokens(usage: &Value) -> u64 {
+    let direct_tokens = [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .filter_map(|key| usage.get(*key).and_then(Value::as_u64))
+    .sum::<u64>();
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    direct_tokens.saturating_add(cache_read / CACHE_READ_TOKEN_WEIGHT_DIVISOR)
 }
 
 #[derive(Debug, Deserialize)]
@@ -551,6 +566,17 @@ mod tests {
         let events = parser.read_delta().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tokens, 7);
+    }
+
+    #[test]
+    fn uses_message_id_for_stable_deduplication() {
+        let path = Path::new("/tmp/session.jsonl");
+        let line = r#"{"type":"assistant","timestamp":"2026-05-21T01:01:24.096Z","message":{"id":"msg_123","usage":{"input_tokens":6,"output_tokens":3,"cache_creation_input_tokens":10,"cache_read_input_tokens":20}}}"#;
+
+        let event = parse_usage_line(path, 42, line).expect("usage event");
+
+        assert_eq!(event.event_id, "/tmp/session.jsonl:msg_123");
+        assert_eq!(event.tokens, 21);
     }
 
     #[test]

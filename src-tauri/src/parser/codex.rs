@@ -12,7 +12,7 @@ use std::time::SystemTime;
 const PARSER_NAME: &str = "codex";
 const INITIALIZED_KEY: &str = "__initialized";
 const MAX_RATE_LIMIT_SESSION_FILES: usize = 12;
-const CODEX_LOCAL_ACCOUNTING_ENABLED: bool = false;
+const CODEX_LOCAL_ACCOUNTING_ENABLED: bool = true;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexRateLimitStatus {
@@ -327,7 +327,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn local_thread_token_deltas_are_not_used_for_codex_accounting() {
+    fn local_thread_token_deltas_are_used_for_codex_fallback_accounting() {
         let dir = tempfile::tempdir().expect("temp dir");
         let codex_db = dir.path().join("state_5.sqlite");
         let app_db = dir.path().join("usage.sqlite");
@@ -338,7 +338,9 @@ mod tests {
 
         seed_thread(&codex_db, "thread-a", 130);
         let events = parser.read_delta().unwrap();
-        assert!(events.is_empty());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, UsageSource::Codex);
+        assert_eq!(events[0].tokens, 30);
     }
 
     fn seed_thread(path: &PathBuf, id: &str, tokens: u64) {

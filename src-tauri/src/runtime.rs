@@ -158,23 +158,46 @@ fn apply_live_codex_rate_limit(
             tray_state.cx.status_message = Some("공식 확인".to_string());
         }
         Some(status) => {
-            tray_state.cx.percent_used = None;
-            tray_state.cx.reset_at = None;
-            tray_state.cx.estimated = false;
-            tray_state.cx.status_source = Some("stale_observation".to_string());
+            let has_local_estimate = tray_state.cx.percent_used.is_some();
+            tray_state.cx.estimated = has_local_estimate;
+            tray_state.cx.status_source = Some(
+                if has_local_estimate {
+                    "local_estimate_with_stale_observation"
+                } else {
+                    "stale_observation"
+                }
+                .to_string(),
+            );
             tray_state.cx.observed_at = Some(status.observed_at);
-            tray_state.cx.status_message = Some(format!(
+            let stale_message = format!(
                 "마지막 공식 확인 {} 전",
                 format_elapsed_since(tray_state.now, status.observed_at)
-            ));
+            );
+            tray_state.cx.status_message = Some(if has_local_estimate {
+                format!("로컬 추정 · {stale_message}")
+            } else {
+                stale_message
+            });
         }
         None => {
-            tray_state.cx.percent_used = None;
-            tray_state.cx.reset_at = None;
-            tray_state.cx.estimated = false;
-            tray_state.cx.status_source = Some("unavailable".to_string());
+            let has_local_estimate = tray_state.cx.percent_used.is_some();
+            if !has_local_estimate {
+                tray_state.cx.reset_at = None;
+            }
+            tray_state.cx.status_source = Some(
+                if has_local_estimate {
+                    "local_estimate"
+                } else {
+                    "unavailable"
+                }
+                .to_string(),
+            );
             tray_state.cx.observed_at = None;
-            tray_state.cx.status_message = Some("공식 실시간 데이터 없음".to_string());
+            tray_state.cx.status_message = Some(if has_local_estimate {
+                "로컬 추정".to_string()
+            } else {
+                "공식 실시간 데이터 없음".to_string()
+            });
         }
     }
 }
@@ -348,6 +371,52 @@ mod tests {
         assert_eq!(
             state.cx.status_message.as_deref(),
             Some("공식 실시간 데이터 없음")
+        );
+    }
+
+    #[test]
+    fn missing_codex_observation_preserves_local_estimate() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
+        let mut state = TrayDisplayState::empty(now);
+        state.cx.percent_used = Some(64);
+        state.cx.reset_at = Some(now + Duration::hours(4));
+        state.cx.estimated = true;
+
+        apply_live_codex_rate_limit(&mut state, None);
+
+        assert_eq!(state.cx.percent_used, Some(64));
+        assert_eq!(state.cx.reset_at, Some(now + Duration::hours(4)));
+        assert!(state.cx.estimated);
+        assert_eq!(state.cx.status_source.as_deref(), Some("local_estimate"));
+        assert_eq!(state.cx.status_message.as_deref(), Some("로컬 추정"));
+    }
+
+    #[test]
+    fn stale_codex_observation_preserves_local_estimate() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
+        let mut state = TrayDisplayState::empty(now);
+        state.cx.percent_used = Some(64);
+        state.cx.reset_at = Some(now + Duration::hours(4));
+        state.cx.estimated = true;
+
+        apply_live_codex_rate_limit(
+            &mut state,
+            Some(codex_status(
+                now - Duration::minutes(6),
+                now + Duration::hours(2),
+            )),
+        );
+
+        assert_eq!(state.cx.percent_used, Some(64));
+        assert_eq!(state.cx.reset_at, Some(now + Duration::hours(4)));
+        assert!(state.cx.estimated);
+        assert_eq!(
+            state.cx.status_source.as_deref(),
+            Some("local_estimate_with_stale_observation")
+        );
+        assert_eq!(
+            state.cx.status_message.as_deref(),
+            Some("로컬 추정 · 마지막 공식 확인 6분 전")
         );
     }
 }

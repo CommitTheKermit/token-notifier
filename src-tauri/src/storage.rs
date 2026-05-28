@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 const LOCAL_ACCOUNTING_GENERATION_KEY: &str = "local_accounting_generation";
-const CURRENT_LOCAL_ACCOUNTING_GENERATION: &str = "3";
+const CURRENT_LOCAL_ACCOUNTING_GENERATION: &str = "4";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HourlyPoint {
@@ -398,27 +398,15 @@ impl UsageStore {
             return Ok(());
         }
 
-        if current.as_deref() == Some("2") {
-            self.conn.execute_batch(
-                "
-                DELETE FROM hourly_bucket WHERE source = 'cx';
-                DELETE FROM daily_rollup WHERE source = 'cx';
-                DELETE FROM threshold_state WHERE source = 'cx';
-                DELETE FROM processed_usage_event WHERE source = 'cx';
-                DELETE FROM parser_state WHERE parser = 'codex';
-                ",
-            )?;
-        } else {
-            self.conn.execute_batch(
-                "
-                DELETE FROM hourly_bucket;
-                DELETE FROM daily_rollup;
-                DELETE FROM threshold_state;
-                DELETE FROM processed_usage_event;
-                DELETE FROM parser_state;
-                ",
-            )?;
-        }
+        self.conn.execute_batch(
+            "
+            DELETE FROM hourly_bucket;
+            DELETE FROM daily_rollup;
+            DELETE FROM threshold_state;
+            DELETE FROM processed_usage_event;
+            DELETE FROM parser_state;
+            ",
+        )?;
         self.conn.execute(
             "INSERT INTO schema_meta (key, value)
              VALUES (?1, ?2)
@@ -564,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_two_migration_removes_only_codex_local_accounting() {
+    fn generation_migration_rebases_all_local_accounting() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("usage.sqlite");
         {
@@ -621,7 +609,7 @@ mod tests {
                 .rollups_for(UsageSource::ClaudeCode, at)
                 .unwrap()
                 .day_tokens,
-            100
+            0
         );
         assert_eq!(
             store
