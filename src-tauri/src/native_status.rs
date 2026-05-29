@@ -5,11 +5,12 @@ mod macos {
         define_class, rc::Retained, DeclaredClass, MainThreadMarker, MainThreadOnly, Message,
     };
     use objc2_app_kit::{NSAttributedStringNSExtendedStringDrawing, NSStringDrawingOptions};
+    use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
     use objc2_app_kit::{
-        NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName,
+        NSApplication, NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName,
         NSForegroundColorAttributeName, NSLineBreakMode, NSMutableParagraphStyle,
-        NSParagraphStyleAttributeName, NSPopover, NSPopoverBehavior, NSStatusBar, NSStatusItem,
-        NSTextAlignment, NSView, NSViewController,
+        NSParagraphStyleAttributeName, NSPopover, NSPopoverBehavior, NSPopoverDelegate,
+        NSStatusBar, NSStatusItem, NSTextAlignment, NSView, NSViewController,
     };
     use objc2_foundation::{
         NSAttributedString, NSDictionary, NSPoint, NSRect, NSRectEdge, NSSize, NSString,
@@ -32,6 +33,7 @@ mod macos {
         view: Retained<StatusView>,
         popover: RefCell<Option<Retained<NSPopover>>>,
         popover_view: RefCell<Option<Retained<PopoverView>>>,
+        popover_delegate: RefCell<Option<Retained<PopoverDelegate>>>,
     }
 
     #[derive(Debug)]
@@ -74,15 +76,14 @@ mod macos {
                 attributed_title.drawWithRect_options_context(draw_rect, options, None);
             }
 
+            // 클릭은 의도적으로 무시. 클릭 시 띄우던 native popover는 macOS의 detached
+            // state 전환 이슈로 인해 일관된 동작을 보장하기 어려워 폐기됨. 추후 별도의 UI로
+            // 다시 구현 예정.
             #[unsafe(method(mouseDown:))]
-            fn mouse_down(&self, _event: &NSEvent) {
-                let _ = self.ivars().sender.send(NativeStatusClick::OpenPopover);
-            }
+            fn mouse_down(&self, _event: &NSEvent) {}
 
             #[unsafe(method(rightMouseDown:))]
-            fn right_mouse_down(&self, _event: &NSEvent) {
-                let _ = self.ivars().sender.send(NativeStatusClick::OpenSettings);
-            }
+            fn right_mouse_down(&self, _event: &NSEvent) {}
         }
     );
 
@@ -96,6 +97,27 @@ mod macos {
             #[unsafe(method(drawRect:))]
             fn draw_rect(&self, _dirty_rect: NSRect) {
                 draw_popover_content(self.bounds(), &self.ivars().state.borrow());
+            }
+        }
+    );
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "TokenNotifierPopoverDelegate"]
+        #[ivars = ()]
+        struct PopoverDelegate;
+
+        unsafe impl NSObjectProtocol for PopoverDelegate {}
+
+        unsafe impl NSPopoverDelegate for PopoverDelegate {
+            #[unsafe(method(popoverShouldDetach:))]
+            fn popover_should_detach(&self, _popover: &NSPopover) -> bool {
+                // macOS가 시스템 이유로 popover를 detach(화살표 없는 floating window) 시키는
+                // 케이스를 차단한다. Detached 상태에서는 NSPopoverBehavior::Transient의 외부
+                // 클릭 자동 close가 더 이상 동작하지 않으므로, 명시적으로 NO를 반환해
+                // 항상 attached 상태를 유지한다.
+                false
             }
         }
     );
@@ -140,6 +162,7 @@ mod macos {
                     view,
                     popover: RefCell::new(None),
                     popover_view: RefCell::new(None),
+                    popover_delegate: RefCell::new(None),
                 });
             } else if let Some(state) = cell.borrow().as_ref() {
                 set_status_title(&state.view, initial_title, tooltip);
@@ -178,46 +201,53 @@ mod macos {
                 return;
             };
 
-            if let Some(popover) = state.popover.borrow().as_ref() {
+            // 캐시된 popover가 detached 상태로 transition된 경우 Transient close가 먹지
+            // 않는다. 클릭마다 캐시된 객체는 폐기하고 재생성해 항상 attached + arrow
+            // 상태로 시작하도록 강제한다.
+            let cached_popover = state.popover.borrow_mut().take();
+            *state.popover_view.borrow_mut() = None;
+            if let Some(popover) = cached_popover {
                 if popover.isShown() {
                     popover.close();
                     return;
                 }
             }
 
-            let existing_popover = state.popover.borrow().as_ref().cloned();
-            let popover = match existing_popover {
-                Some(popover) => popover,
-                None => {
-                    let popover = NSPopover::init(NSPopover::alloc(mtm));
-                    popover.setBehavior(NSPopoverBehavior::Transient);
-                    popover.setAnimates(true);
-                    popover.setContentSize(NSSize::new(POPOVER_WIDTH, POPOVER_HEIGHT));
+            let popover = NSPopover::init(NSPopover::alloc(mtm));
+            popover.setBehavior(NSPopoverBehavior::Transient);
+            popover.setAnimates(false);
+            popover.setContentSize(NSSize::new(POPOVER_WIDTH, POPOVER_HEIGHT));
 
-                    let content_frame = NSRect::new(
-                        NSPoint::new(0.0, 0.0),
-                        NSSize::new(POPOVER_WIDTH, POPOVER_HEIGHT),
-                    );
-                    let popover_view = mtm.alloc().set_ivars(PopoverViewIvars {
-                        state: RefCell::new(popover_state.clone()),
-                    });
-                    let popover_view: Retained<PopoverView> = unsafe {
-                        objc2::msg_send![super(popover_view), initWithFrame: content_frame]
-                    };
+            let delegate = mtm.alloc().set_ivars(());
+            let delegate: Retained<PopoverDelegate> =
+                unsafe { objc2::msg_send![super(delegate), init] };
+            popover.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
-                    let controller = NSViewController::new(mtm);
-                    controller.setView(&popover_view);
-                    popover.setContentViewController(Some(&controller));
-
-                    *state.popover.borrow_mut() = Some(popover.clone());
-                    *state.popover_view.borrow_mut() = Some(popover_view);
-                    popover
-                }
+            let content_frame = NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(POPOVER_WIDTH, POPOVER_HEIGHT),
+            );
+            let popover_view = mtm.alloc().set_ivars(PopoverViewIvars {
+                state: RefCell::new(popover_state.clone()),
+            });
+            let popover_view: Retained<PopoverView> = unsafe {
+                objc2::msg_send![super(popover_view), initWithFrame: content_frame]
             };
 
-            if let Some(view) = state.popover_view.borrow().as_ref() {
-                view.set_state(popover_state);
-            }
+            let controller = NSViewController::new(mtm);
+            controller.setView(&popover_view);
+            popover.setContentViewController(Some(&controller));
+
+            *state.popover.borrow_mut() = Some(popover.clone());
+            *state.popover_view.borrow_mut() = Some(popover_view);
+            *state.popover_delegate.borrow_mut() = Some(delegate);
+
+            // Accessory 모드 앱에서는 popover의 underlying NSWindow가 key가 되지 않아
+            // Transient close 트리거가 동작하지 않는다. show 전에 NSApp을 activate해 두면
+            // popover가 attached 상태로 안정적으로 뜨고, 이후 외부 클릭/포커스 손실 시
+            // Transient close가 자동으로 동작한다.
+            #[allow(deprecated)]
+            NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
 
             popover.showRelativeToRect_ofView_preferredEdge(
                 state.view.bounds(),
@@ -598,7 +628,6 @@ impl Default for NativePopoverState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeStatusClick {
     OpenPopover,
-    OpenSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

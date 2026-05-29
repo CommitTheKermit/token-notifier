@@ -80,11 +80,6 @@ fn open_login_items_settings() {
     autostart::open_login_items_settings();
 }
 
-#[tauri::command]
-fn open_settings_window<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
-    tray::open_settings_window(&app);
-}
-
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
@@ -96,8 +91,7 @@ pub fn run() {
             get_settings,
             save_settings,
             get_autostart_status,
-            open_login_items_settings,
-            open_settings_window
+            open_login_items_settings
         ])
         // Autostart intentionally uses the SMAppService wrapper in autostart.rs.
         // tauri-plugin-autostart remains available but is not initialized in its

@@ -130,10 +130,6 @@ async function render() {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  document.querySelector('#settings-action').addEventListener('click', () => {
-    invoke('open_settings_window').catch((error) => console.error(error));
-  });
-
   Promise.all([
     render(),
     invoke('get_current_tray_state').then(renderTrayState),

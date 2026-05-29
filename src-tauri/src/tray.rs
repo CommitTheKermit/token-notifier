@@ -3,7 +3,7 @@ use crate::window_estimator::UsageSnapshot;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
-use tauri::{App, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::App;
 
 use crate::native_status::{NativePopoverSourceState, NativePopoverState, NativeStatusClick};
 
@@ -136,19 +136,10 @@ pub fn build_main_tray(app: &App) -> tauri::Result<()> {
     std::thread::spawn(move || {
         while let Ok(click) = click_receiver.recv() {
             let app = app_handle.clone();
-            let window_app = app.clone();
             let _ = app.run_on_main_thread(move || match click {
                 NativeStatusClick::OpenPopover => {
                     crate::native_status::toggle_popover(native_popover_state())
                 }
-                NativeStatusClick::OpenSettings => open_or_focus_window(
-                    &window_app,
-                    "settings",
-                    "settings.html",
-                    "Token Notifier Settings",
-                    460.0,
-                    520.0,
-                ),
             });
         }
     });
@@ -173,17 +164,6 @@ pub fn latest_display_state() -> TrayDisplayState {
         .get()
         .and_then(|state| state.lock().ok().map(|state| state.clone()))
         .unwrap_or_else(|| TrayDisplayState::empty(Utc::now()))
-}
-
-pub fn open_settings_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    open_or_focus_window(
-        app,
-        "settings",
-        "settings.html",
-        "Token Notifier Settings",
-        460.0,
-        520.0,
-    );
 }
 
 fn store_latest_display_state(state: &TrayDisplayState) {
@@ -374,29 +354,6 @@ fn format_countdown(now: DateTime<Utc>, reset_at: DateTime<Utc>) -> String {
         format!("{hours}h{minutes:02}m")
     } else {
         format!("{minutes}m")
-    }
-}
-
-fn open_or_focus_window<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    label: &str,
-    url: &str,
-    title: &str,
-    width: f64,
-    height: f64,
-) {
-    if let Some(window) = app.get_webview_window(label) {
-        let _ = window.show();
-        let _ = window.set_focus();
-    } else if let Ok(window) = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
-        .title(title)
-        .inner_size(width, height)
-        .resizable(false)
-        .visible(true)
-        .build()
-    {
-        let _ = window.show();
-        let _ = window.set_focus();
     }
 }
 
