@@ -36,8 +36,20 @@ pub fn start_background_runtime<R: tauri::Runtime>(app: AppHandle<R>) -> anyhow:
             interval.tick().await;
             match scheduler.poll_once() {
                 Ok(Some(outcome)) => {
-                    if let Err(error) = handle_outcome(&app, &outcome.snapshots) {
-                        eprintln!("token-notifier runtime update failed: {error:#}");
+                    let app_for_outcome = app.clone();
+                    let snapshots_for_outcome = outcome.snapshots.clone();
+                    let outcome_result = tauri::async_runtime::spawn_blocking(move || {
+                        handle_outcome(&app_for_outcome, &snapshots_for_outcome)
+                    })
+                    .await;
+                    match outcome_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            eprintln!("token-notifier runtime update failed: {error:#}")
+                        }
+                        Err(error) => {
+                            eprintln!("token-notifier runtime update join failed: {error:#}")
+                        }
                     }
                     if let Some(reset_at) = outcome
                         .snapshots
@@ -49,12 +61,20 @@ pub fn start_background_runtime<R: tauri::Runtime>(app: AppHandle<R>) -> anyhow:
                         let app_for_reset = app.clone();
                         scheduler.schedule_reset(reset_at, move |generation| {
                             let _ = app_for_reset.emit("usage-reset", generation);
-                            let _ = publish_tray_state(&app_for_reset, &[]);
+                            let app_for_publish = app_for_reset.clone();
+                            tauri::async_runtime::spawn_blocking(move || {
+                                let _ = publish_tray_state(&app_for_publish, &[]);
+                            });
                         });
                     }
                 }
                 Ok(None) => {
-                    let _ = publish_tray_state(&app, &scheduler.current_snapshots());
+                    let app_for_publish = app.clone();
+                    let snapshots = scheduler.current_snapshots();
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        let _ = publish_tray_state(&app_for_publish, &snapshots);
+                    })
+                    .await;
                 }
                 Err(error) => eprintln!("token-notifier poll failed: {error:#}"),
             }
@@ -166,26 +186,15 @@ fn apply_live_codex_rate_limit(
             tray_state.cx.status_message = Some("공식 확인".to_string());
         }
         Some(status) => {
-            let has_local_estimate = tray_state.cx.percent_used.is_some();
-            tray_state.cx.estimated = has_local_estimate;
-            tray_state.cx.status_source = Some(
-                if has_local_estimate {
-                    "local_estimate_with_stale_observation"
-                } else {
-                    "stale_observation"
-                }
-                .to_string(),
-            );
+            tray_state.cx.percent_used = Some(status.remaining_percent);
+            tray_state.cx.reset_at = Some(status.reset_at);
+            tray_state.cx.estimated = false;
+            tray_state.cx.status_source = Some("stale_observation".to_string());
             tray_state.cx.observed_at = Some(status.observed_at);
-            let stale_message = format!(
+            tray_state.cx.status_message = Some(format!(
                 "마지막 공식 확인 {} 전",
                 format_elapsed_since(tray_state.now, status.observed_at)
-            );
-            tray_state.cx.status_message = Some(if has_local_estimate {
-                format!("로컬 추정 · {stale_message}")
-            } else {
-                stale_message
-            });
+            ));
         }
         None => {
             let has_local_estimate = tray_state.cx.percent_used.is_some();
@@ -370,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_codex_observation_hides_percent_and_reset() {
+    fn stale_codex_observation_still_displays_official_percent() {
         let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
         let mut state = TrayDisplayState::empty(now);
         apply_live_codex_rate_limit(
@@ -381,8 +390,9 @@ mod tests {
             )),
         );
 
-        assert_eq!(state.cx.percent_used, None);
-        assert_eq!(state.cx.reset_at, None);
+        assert_eq!(state.cx.percent_used, Some(58));
+        assert_eq!(state.cx.reset_at, Some(now + Duration::hours(2)));
+        assert!(!state.cx.estimated);
         assert_eq!(state.cx.status_source.as_deref(), Some("stale_observation"));
         assert_eq!(
             state.cx.status_message.as_deref(),
@@ -423,10 +433,10 @@ mod tests {
     }
 
     #[test]
-    fn stale_codex_observation_preserves_local_estimate() {
+    fn stale_codex_observation_overrides_local_estimate() {
         let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
         let mut state = TrayDisplayState::empty(now);
-        state.cx.percent_used = Some(64);
+        state.cx.percent_used = Some(0);
         state.cx.reset_at = Some(now + Duration::hours(4));
         state.cx.estimated = true;
 
@@ -438,16 +448,13 @@ mod tests {
             )),
         );
 
-        assert_eq!(state.cx.percent_used, Some(64));
-        assert_eq!(state.cx.reset_at, Some(now + Duration::hours(4)));
-        assert!(state.cx.estimated);
-        assert_eq!(
-            state.cx.status_source.as_deref(),
-            Some("local_estimate_with_stale_observation")
-        );
+        assert_eq!(state.cx.percent_used, Some(58));
+        assert_eq!(state.cx.reset_at, Some(now + Duration::hours(2)));
+        assert!(!state.cx.estimated);
+        assert_eq!(state.cx.status_source.as_deref(), Some("stale_observation"));
         assert_eq!(
             state.cx.status_message.as_deref(),
-            Some("로컬 추정 · 마지막 공식 확인 6분 전")
+            Some("마지막 공식 확인 6분 전")
         );
     }
 }

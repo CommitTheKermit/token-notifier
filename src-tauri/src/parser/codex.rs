@@ -7,12 +7,24 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration as StdDuration, SystemTime};
 
 const PARSER_NAME: &str = "codex";
 const INITIALIZED_KEY: &str = "__initialized";
 const MAX_RATE_LIMIT_SESSION_FILES: usize = 12;
 const CODEX_LOCAL_ACCOUNTING_ENABLED: bool = true;
+const CODEX_WHAM_USAGE_ENDPOINT: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_USER_AGENT: &str = "codex-cli";
+const RATE_LIMIT_FETCH_TTL: StdDuration = StdDuration::from_secs(60);
+
+static RATE_LIMIT_CACHE: OnceLock<Mutex<RateLimitMemoryCache>> = OnceLock::new();
+
+#[derive(Debug, Default)]
+struct RateLimitMemoryCache {
+    checked_at: Option<SystemTime>,
+    status: Option<CodexRateLimitStatus>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexRateLimitStatus {
@@ -67,12 +79,36 @@ impl CodexParser {
     }
 
     pub fn latest_rate_limit_status() -> Option<CodexRateLimitStatus> {
-        let root = dirs::home_dir()?.join(".codex").join("sessions");
-        let session_status = latest_rate_limit_observation_from_root(&root)
-            .ok()
-            .flatten();
-        let cached_status = latest_cached_rate_limit_status();
-        newer_rate_limit_observation(cached_status, session_status)
+        let cache = RATE_LIMIT_CACHE.get_or_init(|| Mutex::new(RateLimitMemoryCache::default()));
+        if let Ok(cache) = cache.lock() {
+            if cache
+                .checked_at
+                .and_then(|checked_at| checked_at.elapsed().ok())
+                .is_some_and(|elapsed| elapsed < RATE_LIMIT_FETCH_TTL)
+            {
+                return cache.status.clone();
+            }
+        }
+
+        let fetched_status = fetch_rate_limit_status().ok().flatten();
+        if let Some(status) = &fetched_status {
+            let _ = write_cached_rate_limit_status(status);
+        }
+
+        let status = fetched_status.or_else(|| {
+            let root = dirs::home_dir().map(|home| home.join(".codex").join("sessions"));
+            let session_status = root
+                .as_deref()
+                .and_then(|root| latest_rate_limit_observation_from_root(root).ok().flatten());
+            let cached_status = latest_cached_rate_limit_status();
+            newer_rate_limit_observation(cached_status, session_status)
+        });
+
+        if let Ok(mut cache) = cache.lock() {
+            cache.checked_at = Some(SystemTime::now());
+            cache.status = status.clone();
+        }
+        status
     }
 
     fn load_state_if_needed(&mut self) -> anyhow::Result<()> {
@@ -316,6 +352,98 @@ fn cached_status_path() -> Option<PathBuf> {
     crate::config::app_support_dir().map(|dir| dir.join("codex-rate-limit.json"))
 }
 
+fn write_cached_rate_limit_status(status: &CodexRateLimitStatus) -> anyhow::Result<()> {
+    let Some(path) = cached_status_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let payload = CodexRateLimitCacheFile {
+        timestamp: status.observed_at,
+        status: status.clone(),
+    };
+    let raw = serde_json::to_string(&payload)?;
+    fs::write(path, raw)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CodexAuthTokens {
+    access_token: String,
+    account_id: Option<String>,
+}
+
+fn read_codex_auth() -> Option<CodexAuthTokens> {
+    let path = dirs::home_dir()?.join(".codex").join("auth.json");
+    let raw = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let tokens = value.get("tokens")?;
+    let access_token = tokens.get("access_token")?.as_str()?.trim();
+    if access_token.is_empty() {
+        return None;
+    }
+    let account_id = tokens
+        .get("account_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(CodexAuthTokens {
+        access_token: access_token.to_string(),
+        account_id,
+    })
+}
+
+fn fetch_rate_limit_status() -> anyhow::Result<Option<CodexRateLimitStatus>> {
+    let Some(auth) = read_codex_auth() else {
+        return Ok(None);
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(StdDuration::from_secs(10))
+        .build()?;
+    let mut request = client
+        .get(CODEX_WHAM_USAGE_ENDPOINT)
+        .bearer_auth(&auth.access_token)
+        .header("User-Agent", CODEX_USER_AGENT)
+        .header("Accept", "application/json");
+    if let Some(account_id) = auth.account_id.as_deref() {
+        request = request.header("ChatGPT-Account-Id", account_id);
+    }
+    let response = request.send()?;
+    let status = response.status();
+    if !status.is_success() {
+        eprintln!("token-notifier codex wham/usage HTTP {status}");
+        return Ok(None);
+    }
+    let value: Value = response.json()?;
+    Ok(parse_wham_usage_response(&value, Utc::now()))
+}
+
+fn parse_wham_usage_response(value: &Value, now: DateTime<Utc>) -> Option<CodexRateLimitStatus> {
+    let primary = value
+        .get("rate_limit")?
+        .get("primary_window")
+        .filter(|v| !v.is_null())?;
+    let used_percent = primary.get("used_percent").and_then(Value::as_f64)?;
+    let reset_at = primary
+        .get("reset_at")
+        .and_then(Value::as_i64)
+        .and_then(|secs| Utc.timestamp_opt(secs, 0).single())?;
+    let window_minutes = primary
+        .get("limit_window_seconds")
+        .and_then(Value::as_u64)
+        .map(|secs| secs / 60)
+        .unwrap_or(300);
+    let used_percent = rounded_percent(used_percent);
+    let remaining_percent = 100u8.saturating_sub(used_percent);
+    Some(CodexRateLimitStatus {
+        observed_at: now,
+        used_percent,
+        remaining_percent,
+        reset_at,
+        window_minutes,
+    })
+}
+
 fn newer_rate_limit_observation(
     left: Option<CodexRateLimitStatus>,
     right: Option<CodexRateLimitStatus>,
@@ -459,5 +587,41 @@ mod tests {
         let status = newer_rate_limit_observation(Some(new), Some(old)).expect("status");
         assert_eq!(status.used_percent, 63);
         assert_eq!(status.remaining_percent, 37);
+    }
+
+    #[test]
+    fn parses_wham_usage_primary_window_into_status() {
+        let reset_at = Utc::now() + Duration::hours(4);
+        let body = serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 23.7,
+                    "limit_window_seconds": 18000,
+                    "reset_at": reset_at.timestamp(),
+                },
+                "secondary_window": {
+                    "used_percent": 48,
+                    "limit_window_seconds": 604800,
+                    "reset_at": reset_at.timestamp() + 100000,
+                }
+            }
+        });
+        let now = Utc::now();
+        let status = parse_wham_usage_response(&body, now).expect("primary window present");
+        assert_eq!(status.used_percent, 24);
+        assert_eq!(status.remaining_percent, 76);
+        assert_eq!(status.window_minutes, 300);
+        assert_eq!(status.reset_at.timestamp(), reset_at.timestamp());
+        assert_eq!(status.observed_at, now);
+    }
+
+    #[test]
+    fn skips_wham_usage_when_primary_window_is_null() {
+        let body = serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": { "primary_window": null, "secondary_window": null }
+        });
+        assert!(parse_wham_usage_response(&body, Utc::now()).is_none());
     }
 }

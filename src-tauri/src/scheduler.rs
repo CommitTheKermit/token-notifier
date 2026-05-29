@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration as TokioDuration, Instant};
 
-pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
+pub const MIN_POLL_INTERVAL_SECS: u64 = 90;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PollOutcome {
