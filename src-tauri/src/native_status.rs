@@ -1,25 +1,32 @@
 #[cfg(target_os = "macos")]
 mod macos {
     use super::{NativePopoverAction, NativePopoverState, NativeStatusAnchor, NativeStatusClick};
+    use block2::RcBlock;
+    use objc2::runtime::AnyObject;
     use objc2::{
         define_class, rc::Retained, AnyThread, DeclaredClass, MainThreadMarker, MainThreadOnly,
         Message,
     };
-    use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
     use objc2_app_kit::NSAttributedStringNSExtendedStringDrawing;
     use objc2_app_kit::{
-        NSApplication, NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName, NSFontWeight,
-        NSForegroundColorAttributeName, NSLineBreakMode, NSMutableParagraphStyle,
-        NSParagraphStyleAttributeName, NSPopover, NSPopoverBehavior, NSPopoverDelegate,
-        NSStatusBar, NSStatusItem, NSStringDrawingOptions, NSTextAlignment, NSView,
-        NSViewController,
-    };
-    use objc2_foundation::{
-        NSAttributedString, NSDictionary, NSPoint, NSRange, NSRect, NSRectEdge, NSSize, NSString,
+        NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSEventMask, NSFont,
+        NSFontAttributeName, NSFontWeight, NSForegroundColorAttributeName, NSLineBreakMode,
+        NSMutableParagraphStyle, NSPanel, NSParagraphStyleAttributeName, NSStatusBar, NSStatusItem,
+        NSStringDrawingOptions, NSTextAlignment, NSView, NSVisualEffectBlendingMode,
+        NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowStyleMask,
     };
     use objc2_foundation::NSMutableAttributedString;
+    use objc2_foundation::{
+        NSAttributedString, NSDictionary, NSPoint, NSRange, NSRect, NSSize, NSString,
+    };
     use std::cell::RefCell;
+    use std::ptr::NonNull;
     use std::sync::mpsc::Sender;
+
+    // 떠 있는 패널을 메뉴바 아래 몇 px 띄운다.
+    const PANEL_GAP: f64 = 6.0;
+    // 팝업 메뉴 수준(kCGPopUpMenuWindowLevel). 다른 앱 창 위에 뜬다.
+    const PANEL_LEVEL: isize = 101;
 
     // 메뉴바(D6): 단일 줄 `12% 84%`. 큰 숫자 + 작은 % (위치로만 클로드코드/코덱스 구분).
     // 항목 폭은 표시 텍스트에 맞춰 동적으로 정한다(토글로 한쪽을 끄면 빈 공간 없이 줄어듦).
@@ -50,9 +57,11 @@ mod macos {
         item: Retained<NSStatusItem>,
         view: Retained<StatusView>,
         action_sender: Sender<NativePopoverAction>,
-        popover: RefCell<Option<Retained<NSPopover>>>,
-        popover_view: RefCell<Option<Retained<PopoverView>>>,
-        popover_delegate: RefCell<Option<Retained<PopoverDelegate>>>,
+        // 화살표 없는 떠 있는 패널(NSPanel). 메뉴바 아래에 둥근 모서리로 띄운다.
+        panel: RefCell<Option<Retained<NSPanel>>>,
+        panel_view: RefCell<Option<Retained<PopoverView>>>,
+        // 패널 바깥(다른 앱/데스크톱) 클릭 감지용 전역 이벤트 모니터.
+        monitor: RefCell<Option<Retained<AnyObject>>>,
     }
 
     #[derive(Debug)]
@@ -124,26 +133,11 @@ mod macos {
                     }
                 }
             }
-        }
-    );
 
-    define_class!(
-        #[unsafe(super(NSObject))]
-        #[thread_kind = MainThreadOnly]
-        #[name = "TokenNotifierPopoverDelegate"]
-        #[ivars = ()]
-        struct PopoverDelegate;
-
-        unsafe impl NSObjectProtocol for PopoverDelegate {}
-
-        unsafe impl NSPopoverDelegate for PopoverDelegate {
-            #[unsafe(method(popoverShouldDetach:))]
-            fn popover_should_detach(&self, _popover: &NSPopover) -> bool {
-                // macOS가 시스템 이유로 popover를 detach(화살표 없는 floating window) 시키는
-                // 케이스를 차단한다. Detached 상태에서는 NSPopoverBehavior::Transient의 외부
-                // 클릭 자동 close가 더 이상 동작하지 않으므로, 명시적으로 NO를 반환해
-                // 항상 attached 상태를 유지한다.
-                false
+            // 비활성(nonactivating) 패널이라도 첫 클릭이 토글에 바로 전달되도록 한다.
+            #[unsafe(method(acceptsFirstMouse:))]
+            fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+                true
             }
         }
     );
@@ -193,9 +187,9 @@ mod macos {
                     item,
                     view,
                     action_sender,
-                    popover: RefCell::new(None),
-                    popover_view: RefCell::new(None),
-                    popover_delegate: RefCell::new(None),
+                    panel: RefCell::new(None),
+                    panel_view: RefCell::new(None),
+                    monitor: RefCell::new(None),
                 });
             } else if let Some(state) = cell.borrow().as_ref() {
                 set_status_title(&state.view, initial_title, tooltip);
@@ -218,15 +212,10 @@ mod macos {
                 ));
                 set_status_title(&state.view, title, tooltip);
 
-                // 폭이 줄면 메뉴바에서 아이콘 위치가 이동한다. 이미 열려 있는 팝오버는
-                // 그대로 남아 화살표가 어긋나므로, 새 아이콘 위치로 다시 앵커링한다.
-                if let Some(popover) = state.popover.borrow().as_ref() {
-                    if popover.isShown() {
-                        popover.showRelativeToRect_ofView_preferredEdge(
-                            popover_anchor_rect(&state.view),
-                            &state.view,
-                            NSRectEdge::MinY,
-                        );
+                // 폭이 바뀌면 아이콘 위치가 이동하므로, 열려 있는 패널을 새 위치로 옮긴다.
+                if let Some(panel) = state.panel.borrow().as_ref() {
+                    if let Some(origin) = panel_origin(&state.view) {
+                        panel.setFrameOrigin(origin);
                     }
                 }
             }
@@ -252,7 +241,7 @@ mod macos {
     pub fn update_popover_on_main(popover_state: NativePopoverState) {
         STATUS_STATE.with(|cell| {
             if let Some(state) = cell.borrow().as_ref() {
-                if let Some(view) = state.popover_view.borrow().as_ref() {
+                if let Some(view) = state.panel_view.borrow().as_ref() {
                     view.set_state(popover_state);
                 }
             }
@@ -261,7 +250,7 @@ mod macos {
 
     pub fn toggle_popover_on_main(popover_state: NativePopoverState) {
         let Some(mtm) = MainThreadMarker::new() else {
-            eprintln!("native popover skipped: not on main thread");
+            eprintln!("native panel skipped: not on main thread");
             return;
         };
         STATUS_STATE.with(|cell| {
@@ -270,73 +259,110 @@ mod macos {
                 return;
             };
 
-            // 캐시된 popover가 detached 상태로 transition된 경우 Transient close가 먹지
-            // 않는다. 클릭마다 캐시된 객체는 폐기하고 재생성해 항상 attached + arrow
-            // 상태로 시작하도록 강제한다.
-            let cached_popover = state.popover.borrow_mut().take();
-            *state.popover_view.borrow_mut() = None;
-            if let Some(popover) = cached_popover {
-                if popover.isShown() {
-                    popover.close();
-                    return;
-                }
+            // 이미 떠 있으면 닫고 끝낸다.
+            if state.panel.borrow().is_some() {
+                close_panel(state);
+                return;
             }
-
-            let popover = NSPopover::init(NSPopover::alloc(mtm));
-            popover.setBehavior(NSPopoverBehavior::Transient);
-            popover.setAnimates(false);
-            popover.setContentSize(NSSize::new(POPOVER_WIDTH, POPOVER_HEIGHT));
-
-            let delegate = mtm.alloc().set_ivars(());
-            let delegate: Retained<PopoverDelegate> =
-                unsafe { objc2::msg_send![super(delegate), init] };
-            popover.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
             let content_frame = NSRect::new(
                 NSPoint::new(0.0, 0.0),
                 NSSize::new(POPOVER_WIDTH, POPOVER_HEIGHT),
             );
+
+            // 콘텐츠를 그리는 커스텀 뷰.
             let popover_view = mtm.alloc().set_ivars(PopoverViewIvars {
                 state: RefCell::new(popover_state.clone()),
                 action_sender: state.action_sender.clone(),
             });
-            let popover_view: Retained<PopoverView> = unsafe {
-                objc2::msg_send![super(popover_view), initWithFrame: content_frame]
-            };
+            let popover_view: Retained<PopoverView> =
+                unsafe { objc2::msg_send![super(popover_view), initWithFrame: content_frame] };
 
-            let controller = NSViewController::new(mtm);
-            controller.setView(&popover_view);
-            popover.setContentViewController(Some(&controller));
+            // 블러 + 둥근 모서리 컨테이너.
+            let effect =
+                NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), content_frame);
+            effect.setMaterial(NSVisualEffectMaterial::Popover);
+            effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+            effect.setState(NSVisualEffectState::Active);
+            unsafe {
+                let _: () = objc2::msg_send![&*effect, setWantsLayer: true];
+                let layer: *mut AnyObject = objc2::msg_send![&*effect, layer];
+                if !layer.is_null() {
+                    let _: () = objc2::msg_send![layer, setCornerRadius: 14.0_f64];
+                    let _: () = objc2::msg_send![layer, setMasksToBounds: true];
+                }
+            }
+            effect.addSubview(&popover_view);
 
-            *state.popover.borrow_mut() = Some(popover.clone());
-            *state.popover_view.borrow_mut() = Some(popover_view);
-            *state.popover_delegate.borrow_mut() = Some(delegate);
-
-            // Accessory 모드 앱에서는 popover의 underlying NSWindow가 key가 되지 않아
-            // Transient close 트리거가 동작하지 않는다. show 전에 NSApp을 activate해 두면
-            // popover가 attached 상태로 안정적으로 뜨고, 이후 외부 클릭/포커스 손실 시
-            // Transient close가 자동으로 동작한다.
-            #[allow(deprecated)]
-            NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
-
-            popover.showRelativeToRect_ofView_preferredEdge(
-                popover_anchor_rect(&state.view),
-                &state.view,
-                NSRectEdge::MinY,
+            // 화살표 없는 borderless 비활성 패널.
+            let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
+                NSPanel::alloc(mtm),
+                content_frame,
+                NSWindowStyleMask::NonactivatingPanel,
+                NSBackingStoreType::Buffered,
+                false,
             );
+            unsafe { panel.setReleasedWhenClosed(false) };
+            panel.setOpaque(false);
+            panel.setBackgroundColor(Some(&NSColor::clearColor()));
+            panel.setHasShadow(true);
+            panel.setLevel(PANEL_LEVEL);
+            panel.setFloatingPanel(true);
+            panel.setHidesOnDeactivate(false);
+            panel.setContentView(Some(&effect));
+
+            if let Some(origin) = panel_origin(&state.view) {
+                panel.setFrameOrigin(origin);
+            }
+            panel.orderFrontRegardless();
+
+            // 패널 바깥(다른 앱/데스크톱/메뉴바 다른 항목) 클릭 시 닫는다. 전역 모니터는
+            // 우리 앱으로 전달되는 이벤트(패널 내부 클릭 등)에는 발화하지 않으므로
+            // 패널 내부 토글 조작은 영향받지 않는다.
+            let handler = RcBlock::new(|_event: NonNull<NSEvent>| {
+                close_active_panel();
+            });
+            let monitor = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(
+                NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown,
+                &handler,
+            );
+
+            *state.panel.borrow_mut() = Some(panel);
+            *state.panel_view.borrow_mut() = Some(popover_view);
+            *state.monitor.borrow_mut() = monitor;
         });
     }
 
-    // 팝오버 화살표 앵커. 항목 폭이 줄면 왼쪽으로 줄어들어 중심은 이동하지만
-    // 오른쪽 모서리는 메뉴바에서 위치가 안정적이다. 오른쪽 가장자리에 화살표를
-    // 고정해 토글로 폭이 바뀌어도 화살표가 흔들리지 않게 한다(디자인의 우측 정렬 의도).
-    fn popover_anchor_rect(view: &StatusView) -> NSRect {
-        let bounds = view.bounds();
-        let width = 1.0;
-        NSRect::new(
-            NSPoint::new(bounds.size.width - width, bounds.origin.y),
-            NSSize::new(width, bounds.size.height),
-        )
+    fn close_panel(state: &StatusState) {
+        if let Some(panel) = state.panel.borrow_mut().take() {
+            panel.orderOut(None);
+        }
+        *state.panel_view.borrow_mut() = None;
+        if let Some(monitor) = state.monitor.borrow_mut().take() {
+            unsafe { NSEvent::removeMonitor(&monitor) };
+        }
+    }
+
+    fn close_active_panel() {
+        STATUS_STATE.with(|cell| {
+            if let Some(state) = cell.borrow().as_ref() {
+                close_panel(state);
+            }
+        });
+    }
+
+    // 패널 좌상단(화면 좌표) 위치. 아이콘 오른쪽 모서리에 패널 오른쪽을 맞추고(우측 정렬)
+    // 메뉴바 바로 아래에 띄운다. 폭이 줄어도 오른쪽 모서리는 안정적이라 위치가 흔들리지 않는다.
+    fn panel_origin(view: &StatusView) -> Option<NSPoint> {
+        let window = view.window()?;
+        let view_frame = view.frame();
+        let window_frame = window.frame();
+        let right = window_frame.origin.x + view_frame.origin.x + view_frame.size.width;
+        let item_bottom = window_frame.origin.y + view_frame.origin.y;
+        Some(NSPoint::new(
+            right - POPOVER_WIDTH,
+            item_bottom - POPOVER_HEIGHT - PANEL_GAP,
+        ))
     }
 
     fn set_status_title(view: &StatusView, title: &str, tooltip: &str) {
