@@ -464,7 +464,7 @@ mod macos {
 
         for (index, source) in sources.iter().enumerate() {
             let top = TOGGLES_TOP + index as f64 * TOGGLE_ROW_H;
-            draw_toggle_row(bounds, width, top, source);
+            draw_toggle_row(bounds, width, top, index, source);
         }
     }
 
@@ -584,14 +584,15 @@ mod macos {
         bounds: NSRect,
         width: f64,
         top: f64,
+        index: usize,
         source: &super::NativePopoverSourceState,
     ) {
         let pad = PANEL_PAD_X;
         let label = NSColor::labelColor();
-        let status = status_color(source.remaining, source.has_percent);
 
+        // 토글 점은 잔량색이 아니라 서비스 구분색(고정)으로 어느 서비스인지 식별만 한다.
         let dot_rect = rect_from_top(pad, top + 16.0, 8.0, 8.0, bounds);
-        draw_rounded_rect(dot_rect, 4.0, &status, None);
+        draw_rounded_rect(dot_rect, 4.0, &service_color(index), None);
 
         let name_font = NSFont::systemFontOfSize(13.5);
         draw_text(
@@ -645,6 +646,14 @@ mod macos {
             srgb(0xb8, 0x7a, 0x3a)
         } else {
             NSColor::labelColor()
+        }
+    }
+
+    // 서비스 구분색(잔량과 무관한 고정색). 따뜻함=클로드코드(0), 차가움=코덱스(1).
+    fn service_color(index: usize) -> Retained<NSColor> {
+        match index {
+            0 => srgb(0xc9, 0x7b, 0x4a),
+            _ => srgb(0x4a, 0x86, 0xc9),
         }
     }
 
