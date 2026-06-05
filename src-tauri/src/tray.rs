@@ -1,11 +1,13 @@
 use crate::parser::UsageSource;
 use crate::window_estimator::UsageSnapshot;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
-use tauri::App;
+use tauri::{App, Emitter};
 
-use crate::native_status::{NativePopoverSourceState, NativePopoverState, NativeStatusClick};
+use crate::native_status::{
+    NativePopoverAction, NativePopoverSourceState, NativePopoverState, NativeStatusClick,
+};
 
 static LAST_DISPLAY_STATE: OnceLock<Mutex<TrayDisplayState>> = OnceLock::new();
 
@@ -95,16 +97,16 @@ pub fn color_for_percent(percent: u8) -> PercentColor {
     }
 }
 
+// D6: 메뉴바는 단일 줄 `12% 84%`. 갱신 시간 등 디테일은 펼친 패널에서만 표시한다.
 pub fn format_tray_label(state: &TrayDisplayState) -> String {
     let state = display_ready_state(state);
     let mut percents = Vec::new();
-    let mut reset_hours = Vec::new();
-    push_grid_source_label(&mut percents, &mut reset_hours, &state.cc, state.now);
-    push_grid_source_label(&mut percents, &mut reset_hours, &state.cx, state.now);
+    push_d6_percent(&mut percents, &state.cc);
+    push_d6_percent(&mut percents, &state.cx);
     if percents.is_empty() {
         "Token Notifier".to_string()
     } else {
-        format!("{}\n{}", percents.join(" "), reset_hours.join(" "))
+        percents.join(" ")
     }
 }
 
@@ -126,11 +128,13 @@ pub fn build_main_tray(app: &App) -> tauri::Result<()> {
     let initial_title = format_tray_label(&initial_state);
     let initial_tooltip = format_tray_tooltip(&initial_state);
     let (click_sender, click_receiver) = std::sync::mpsc::channel();
+    let (action_sender, action_receiver) = std::sync::mpsc::channel();
     crate::native_status::install_initial(
         &app.handle().clone(),
         initial_title,
         initial_tooltip,
         click_sender,
+        action_sender,
     );
     let app_handle = app.handle().clone();
     std::thread::spawn(move || {
@@ -143,7 +147,36 @@ pub fn build_main_tray(app: &App) -> tauri::Result<()> {
             });
         }
     });
+    let app_for_actions = app.handle().clone();
+    std::thread::spawn(move || {
+        while let Ok(action) = action_receiver.recv() {
+            match action {
+                NativePopoverAction::ToggleSource(index) => {
+                    apply_source_toggle(&app_for_actions, index)
+                }
+            }
+        }
+    });
     Ok(())
+}
+
+// 펼친 패널의 '표시 정보 설정' 토글: 해당 서비스의 메뉴바 표시 여부를 settings에 저장하고
+// 메뉴바/팝오버를 즉시 갱신한다. 끄면 메뉴바에서 사라지고 패널 행은 흐려진다.
+fn apply_source_toggle<R: tauri::Runtime>(app: &tauri::AppHandle<R>, index: usize) {
+    let mut settings = crate::settings::load_settings();
+    match index {
+        0 => settings.claude_code.enabled = !settings.claude_code.enabled,
+        1 => settings.codex.enabled = !settings.codex.enabled,
+        _ => return,
+    }
+    let saved = crate::settings::save_settings(&settings).unwrap_or(settings);
+
+    let mut state = latest_display_state();
+    state.cc.enabled = saved.claude_code.enabled;
+    state.cx.enabled = saved.codex.enabled;
+    let _ = update_main_tray(app, &state);
+    let _ = app.emit("settings-reloaded", &saved);
+    let _ = app.emit("usage-update", &state);
 }
 
 pub fn update_main_tray<R: tauri::Runtime>(
@@ -183,29 +216,12 @@ fn native_popover_state() -> NativePopoverState {
 
 fn native_popover_state_from_tray_state(state: &TrayDisplayState) -> NativePopoverState {
     let state = display_ready_state(state);
-    let (rollup_day, rollup_week, rollup_month) = rollup_totals()
-        .map(|(day, week, month)| {
-            (
-                format_tokens(day),
-                format_tokens(week),
-                format_tokens(month),
-            )
-        })
-        .unwrap_or_else(|| ("--".to_string(), "--".to_string(), "--".to_string()));
-
+    // FinalPanel은 두 서비스를 항상 나란히 표시한다 (토글 off여도 흐리게).
     NativePopoverState {
-        sources: [&state.cc, &state.cx]
-            .into_iter()
-            .filter(|source| source.enabled)
-            .map(|source| native_popover_source(source, state.now))
-            .collect(),
-        rollup_day,
-        rollup_week,
-        rollup_month,
-        updated_text: format!(
-            "업데이트 {}",
-            state.now.with_timezone(&chrono::Local).format("%H:%M")
-        ),
+        sources: vec![
+            native_popover_source(&state.cc, state.now),
+            native_popover_source(&state.cx, state.now),
+        ],
     }
 }
 
@@ -214,65 +230,47 @@ fn native_popover_source(source: &SourceTrayState, now: DateTime<Utc>) -> Native
         UsageSource::ClaudeCode => "Claude Code",
         UsageSource::Codex => "Codex",
     };
-    let percent = source.percent_used.unwrap_or(0);
-    let percent_text = source_percent_text(source);
-    let reset_text = source
-        .reset_at
-        .map(|reset_at| format!("다음 갱신까지 {}", format_countdown(now, reset_at)))
-        .unwrap_or_else(|| {
+    let (percent_text, has_percent, remaining) = match source.percent_used {
+        Some(value) => {
+            let estimate = if source.estimated { "~" } else { "" };
+            (format!("{estimate}{value}%"), true, value)
+        }
+        None => ("--".to_string(), false, 0),
+    };
+    let (detail, has_reset) = match source.reset_at {
+        Some(reset_at) => (
+            format!(
+                "{} · {}",
+                format_countdown_korean(now, reset_at),
+                format_reset_clock(reset_at)
+            ),
+            true,
+        ),
+        None => (
             source.status_message.clone().unwrap_or_else(|| {
                 if source.source == UsageSource::ClaudeCode {
                     "로컬 기록 없음".to_string()
                 } else {
-                    "다음 갱신까지 --".to_string()
+                    "--".to_string()
                 }
-            })
-        });
+            }),
+            false,
+        ),
+    };
 
     NativePopoverSourceState {
         label: label.to_string(),
         percent_text,
-        reset_text,
-        fraction: f64::from(percent) / 100.0,
+        remaining,
+        has_percent,
+        detail,
+        has_reset,
+        fraction: f64::from(remaining) / 100.0,
+        enabled: source.enabled,
     }
 }
 
-fn rollup_totals() -> Option<(u64, u64, u64)> {
-    let path = crate::config::database_path()?;
-    let store = crate::storage::UsageStore::open(path).ok()?;
-    let rollups = store.get_rollups(Utc::now()).ok()?;
-    Some(
-        rollups
-            .into_iter()
-            .filter(|item| item.source == UsageSource::ClaudeCode)
-            .fold((0, 0, 0), |acc, item| {
-                (
-                    acc.0 + item.day_tokens,
-                    acc.1 + item.week_tokens,
-                    acc.2 + item.month_tokens,
-                )
-            }),
-    )
-}
-
-fn format_tokens(value: u64) -> String {
-    let digits = value.to_string();
-    let mut out = String::new();
-    for (index, ch) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out.chars().rev().collect::<String>()
-}
-
-fn push_grid_source_label(
-    percents: &mut Vec<String>,
-    reset_hours: &mut Vec<String>,
-    source: &SourceTrayState,
-    now: DateTime<Utc>,
-) {
+fn push_d6_percent(percents: &mut Vec<String>, source: &SourceTrayState) {
     if !source.enabled {
         return;
     }
@@ -282,26 +280,6 @@ fn push_grid_source_label(
         .unwrap_or_else(|| "--%".to_string());
     let estimate = if source.estimated { "~" } else { "" };
     percents.push(format!("{estimate}{percent}"));
-    reset_hours.push(
-        source
-            .reset_at
-            .map(|reset_at| format_reset_hours(now, reset_at))
-            .unwrap_or_else(|| "--h".to_string()),
-    );
-}
-
-fn source_percent_text(source: &SourceTrayState) -> String {
-    source
-        .percent_used
-        .map(|value| format!("{value}%"))
-        .or_else(|| source.status_message.clone())
-        .unwrap_or_else(|| {
-            if source.source == UsageSource::ClaudeCode {
-                "로컬 기록 없음".to_string()
-            } else {
-                "--".to_string()
-            }
-        })
 }
 
 fn push_source_label(parts: &mut Vec<String>, source: &SourceTrayState, now: DateTime<Utc>) {
@@ -330,13 +308,35 @@ fn push_source_label(parts: &mut Vec<String>, source: &SourceTrayState, now: Dat
     parts.push(format!("{prefix} {estimate}{percent} {reset}"));
 }
 
-fn format_reset_hours(now: DateTime<Utc>, reset_at: DateTime<Utc>) -> String {
+// 펼친 패널용 "다음 갱신까지" 카운트다운. 예: "2시간 10분", "38분".
+fn format_countdown_korean(now: DateTime<Utc>, reset_at: DateTime<Utc>) -> String {
     if reset_at <= now {
-        return "0.0h".to_string();
+        return "0분".to_string();
     }
     let total_minutes = (reset_at - now).num_minutes().max(0);
-    let hours = total_minutes as f64 / 60.0;
-    format!("{hours:.1}h")
+    let hours = total_minutes / 60;
+    let minutes = total_minutes % 60;
+    if hours > 0 {
+        format!("{hours}시간 {minutes:02}분")
+    } else {
+        format!("{minutes}분")
+    }
+}
+
+// 갱신 시각을 한국어 12시간제로. 예: "오후 5:44".
+fn format_reset_clock(reset_at: DateTime<Utc>) -> String {
+    let local = reset_at.with_timezone(&chrono::Local);
+    let hour24 = local.hour();
+    let (ampm, hour12) = if hour24 == 0 {
+        ("오전", 12)
+    } else if hour24 < 12 {
+        ("오전", hour24)
+    } else if hour24 == 12 {
+        ("오후", 12)
+    } else {
+        ("오후", hour24 - 12)
+    };
+    format!("{ampm} {hour12}:{:02}", local.minute())
 }
 
 fn format_countdown(now: DateTime<Utc>, reset_at: DateTime<Utc>) -> String {
@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn format_tray_label_uses_percent_over_reset_hour_grid() {
+    fn format_tray_label_is_single_line_percents() {
         let now = Utc.with_ymd_and_hms(2026, 5, 23, 5, 0, 0).unwrap();
         let mut state = TrayDisplayState::empty(now);
         state.cc.percent_used = Some(47);
@@ -375,7 +375,7 @@ mod tests {
         state.cx.percent_used = Some(82);
         state.cx.reset_at = Some(now + Duration::hours(1));
 
-        assert_eq!(format_tray_label(&state), "47% 82%\n3.0h 1.0h");
+        assert_eq!(format_tray_label(&state), "47% 82%");
     }
 
     #[test]
@@ -385,7 +385,7 @@ mod tests {
         state.cc.percent_used = Some(73);
         state.cc.reset_at = Some(now + Duration::minutes(75));
         state.cx.enabled = false;
-        assert_eq!(format_tray_label(&state), "73%\n1.2h");
+        assert_eq!(format_tray_label(&state), "73%");
         assert_eq!(format_tray_tooltip(&state), "CC  73% ↻1h15m");
     }
 
@@ -394,7 +394,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
         let state = TrayDisplayState::empty(now);
 
-        assert_eq!(format_tray_label(&state), "--% --%\n--h --h");
+        assert_eq!(format_tray_label(&state), "--% --%");
         assert_eq!(
             format_tray_tooltip(&state),
             "CC 데이터 없음  CX 공식 실시간 데이터 없음"
@@ -410,9 +410,7 @@ mod tests {
         state.cx.percent_used = Some(100);
         state.cx.reset_at = Some(now + Duration::hours(100));
 
-        let label = format_tray_label(&state);
-        let lines = label.lines().collect::<Vec<_>>();
-        assert_eq!(lines, ["1% 100%", "1.0h 100.0h"]);
+        assert_eq!(format_tray_label(&state), "1% 100%");
     }
 
     #[test]
@@ -425,8 +423,34 @@ mod tests {
         let label = format_tray_label(&state);
         let tooltip = format_tray_tooltip(&state);
         assert!(label.contains("~91%"));
-        assert!(label.contains("0.1h"));
         assert!(tooltip.contains("CX ~ 91% ↻5m"));
+    }
+
+    #[test]
+    fn native_popover_source_formats_reset_detail() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 5, 0, 0).unwrap();
+        let mut state = TrayDisplayState::empty(now);
+        state.cc.percent_used = Some(12);
+        state.cc.reset_at = Some(now + Duration::minutes(130));
+
+        let source = native_popover_source(&state.cc, now);
+        assert_eq!(source.percent_text, "12%");
+        assert_eq!(source.remaining, 12);
+        assert!(source.has_percent);
+        assert!(source.has_reset);
+        assert!(source.detail.starts_with("2시간 10분 · "));
+    }
+
+    #[test]
+    fn native_popover_source_without_percent_is_neutral() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 5, 0, 0).unwrap();
+        let state = TrayDisplayState::empty(now);
+
+        let source = native_popover_source(&state.cx, now);
+        assert_eq!(source.percent_text, "--");
+        assert!(!source.has_percent);
+        assert!(!source.has_reset);
+        assert_eq!(source.detail, "공식 실시간 데이터 없음");
     }
 
     #[test]

@@ -1,35 +1,42 @@
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{NativePopoverState, NativeStatusAnchor, NativeStatusClick};
+    use super::{NativePopoverAction, NativePopoverState, NativeStatusAnchor, NativeStatusClick};
     use objc2::{
-        define_class, rc::Retained, DeclaredClass, MainThreadMarker, MainThreadOnly, Message,
+        define_class, rc::Retained, AnyThread, DeclaredClass, MainThreadMarker, MainThreadOnly,
+        Message,
     };
-    use objc2_app_kit::{NSAttributedStringNSExtendedStringDrawing, NSStringDrawingOptions};
     use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
+    use objc2_app_kit::NSAttributedStringNSExtendedStringDrawing;
     use objc2_app_kit::{
-        NSApplication, NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName,
+        NSApplication, NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName, NSFontWeight,
         NSForegroundColorAttributeName, NSLineBreakMode, NSMutableParagraphStyle,
         NSParagraphStyleAttributeName, NSPopover, NSPopoverBehavior, NSPopoverDelegate,
-        NSStatusBar, NSStatusItem, NSTextAlignment, NSView, NSViewController,
+        NSStatusBar, NSStatusItem, NSStringDrawingOptions, NSTextAlignment, NSView,
+        NSViewController,
     };
     use objc2_foundation::{
-        NSAttributedString, NSDictionary, NSPoint, NSRect, NSRectEdge, NSSize, NSString,
+        NSAttributedString, NSDictionary, NSPoint, NSRange, NSRect, NSRectEdge, NSSize, NSString,
     };
+    use objc2_foundation::NSMutableAttributedString;
     use std::cell::RefCell;
     use std::sync::mpsc::Sender;
 
-    const STATUS_FONT_SIZE: f64 = 8.0;
-    const STATUS_LINE_HEIGHT: f64 = 9.0;
-    // 메뉴바 2줄 표시: 위(퍼센트)는 강조해 크게, 아래(갱신 시간)는 작게.
-    const PERCENT_FONT_SIZE: f64 = 12.0;
-    const PERCENT_LINE_HEIGHT: f64 = 12.0;
-    const RESET_FONT_SIZE: f64 = 7.0;
-    const RESET_LINE_HEIGHT: f64 = 8.0;
-    // 퍼센트 줄과 갱신 시간 줄 사이 세로 여백.
-    const COLUMN_ROW_GAP: f64 = 4.0;
-    const STATUS_ITEM_WIDTH: f64 = 66.0;
-    const POPOVER_WIDTH: f64 = 380.0;
-    const POPOVER_HEIGHT: f64 = 430.0;
+    // 메뉴바(D6): 단일 줄 `12% 84%`. 큰 숫자 + 작은 % (위치로만 클로드코드/코덱스 구분).
+    const STATUS_ITEM_WIDTH: f64 = 70.0;
+    const STATUS_FONT_SIZE: f64 = 13.0;
+    const D6_BIG: f64 = 13.0;
+    const D6_PCT: f64 = 9.0;
+
+    // 펼친 패널(FinalPanel) 레이아웃 상수 (top-origin 거리).
+    const POPOVER_WIDTH: f64 = 296.0;
+    const POPOVER_HEIGHT: f64 = 300.0;
+    const PANEL_PAD_X: f64 = 16.0;
+    const ROWS_TOP: f64 = 34.0;
+    const ROW_H: f64 = 74.0;
+    const TOGGLES_TOP: f64 = 212.0;
+    const TOGGLE_ROW_H: f64 = 40.0;
+    const TOGGLE_W: f64 = 40.0;
+    const TOGGLE_H: f64 = 24.0;
 
     thread_local! {
         static STATUS_STATE: RefCell<Option<StatusState>> = const { RefCell::new(None) };
@@ -38,6 +45,7 @@ mod macos {
     struct StatusState {
         item: Retained<NSStatusItem>,
         view: Retained<StatusView>,
+        action_sender: Sender<NativePopoverAction>,
         popover: RefCell<Option<Retained<NSPopover>>>,
         popover_view: RefCell<Option<Retained<PopoverView>>>,
         popover_delegate: RefCell<Option<Retained<PopoverDelegate>>>,
@@ -52,6 +60,7 @@ mod macos {
     #[derive(Debug)]
     struct PopoverViewIvars {
         state: RefCell<NativePopoverState>,
+        action_sender: Sender<NativePopoverAction>,
     }
 
     define_class!(
@@ -64,17 +73,19 @@ mod macos {
             #[unsafe(method(drawRect:))]
             fn draw_rect(&self, _dirty_rect: NSRect) {
                 let title = self.ivars().title.borrow().clone();
-                draw_status_columns(self.bounds(), &title);
+                draw_status_title(self.bounds(), &title);
             }
 
-            // 클릭은 의도적으로 무시. 클릭 시 띄우던 native popover는 macOS의 detached
-            // state 전환 이슈로 인해 일관된 동작을 보장하기 어려워 폐기됨. 추후 별도의 UI로
-            // 다시 구현 예정.
+            // D6 펼친 패널을 부활시켰다. 클릭하면 아이콘 아래로 패널이 열리고 닫힌다.
             #[unsafe(method(mouseDown:))]
-            fn mouse_down(&self, _event: &NSEvent) {}
+            fn mouse_down(&self, _event: &NSEvent) {
+                let _ = self.ivars().sender.send(NativeStatusClick::OpenPopover);
+            }
 
             #[unsafe(method(rightMouseDown:))]
-            fn right_mouse_down(&self, _event: &NSEvent) {}
+            fn right_mouse_down(&self, _event: &NSEvent) {
+                let _ = self.ivars().sender.send(NativeStatusClick::OpenPopover);
+            }
         }
     );
 
@@ -88,6 +99,26 @@ mod macos {
             #[unsafe(method(drawRect:))]
             fn draw_rect(&self, _dirty_rect: NSRect) {
                 draw_popover_content(self.bounds(), &self.ivars().state.borrow());
+            }
+
+            // 토글 스위치 영역 클릭만 처리. 어느 토글을 눌렀는지 hit-test 후 Rust로 통지한다.
+            #[unsafe(method(mouseDown:))]
+            fn mouse_down(&self, event: &NSEvent) {
+                let bounds = self.bounds();
+                let window_point = event.locationInWindow();
+                let local = self.convertPoint_fromView(window_point, None);
+                let top_y = bounds.size.height - local.y;
+                let width = bounds.size.width;
+                for index in 0..2usize {
+                    let (x, top, w, h) = toggle_hit_rect(index, width);
+                    if local.x >= x && local.x <= x + w && top_y >= top && top_y <= top + h {
+                        let _ = self
+                            .ivars()
+                            .action_sender
+                            .send(NativePopoverAction::ToggleSource(index));
+                        return;
+                    }
+                }
             }
         }
     );
@@ -120,7 +151,12 @@ mod macos {
         }
     }
 
-    pub fn install_on_main(initial_title: &str, tooltip: &str, sender: Sender<NativeStatusClick>) {
+    pub fn install_on_main(
+        initial_title: &str,
+        tooltip: &str,
+        sender: Sender<NativeStatusClick>,
+        action_sender: Sender<NativePopoverAction>,
+    ) {
         let Some(mtm) = MainThreadMarker::new() else {
             eprintln!("native status item install skipped: not on main thread");
             return;
@@ -151,6 +187,7 @@ mod macos {
                 *cell.borrow_mut() = Some(StatusState {
                     item,
                     view,
+                    action_sender,
                     popover: RefCell::new(None),
                     popover_view: RefCell::new(None),
                     popover_delegate: RefCell::new(None),
@@ -220,6 +257,7 @@ mod macos {
             );
             let popover_view = mtm.alloc().set_ivars(PopoverViewIvars {
                 state: RefCell::new(popover_state.clone()),
+                action_sender: state.action_sender.clone(),
             });
             let popover_view: Retained<PopoverView> = unsafe {
                 objc2::msg_send![super(popover_view), initWithFrame: content_frame]
@@ -258,322 +296,331 @@ mod macos {
         NSFont::userFixedPitchFontOfSize(size).unwrap_or_else(|| NSFont::menuBarFontOfSize(size))
     }
 
-    // 메뉴바 타이틀은 최대 2줄: 1줄=에이전트별 퍼센트(크게), 2줄=세션 초기화 시간(작게).
-    // 각 에이전트를 세로 컬럼으로 나눠, 같은 컬럼 폭 안에서 퍼센트/시간을 중앙정렬해 세로로 맞춘다.
-    fn draw_status_columns(bounds: NSRect, title: &str) {
-        let color = NSColor::labelColor();
-        let lines: Vec<&str> = title.split('\n').collect();
-        let center = NSTextAlignment(2);
+    // 큰 숫자에 어울리는 굵은 등폭(tabular) 시스템 폰트. (NSFontWeightBold = 0.4)
+    fn mono_bold(size: f64) -> Retained<NSFont> {
+        let weight: NSFontWeight = 0.4;
+        NSFont::monospacedDigitSystemFontOfSize_weight(size, weight)
+    }
 
-        // 갱신 시간 줄이 없는 fallback(예: "Token Notifier")은 전체를 한 줄 중앙정렬.
-        if lines.len() < 2 {
-            let font = status_font(STATUS_FONT_SIZE);
-            let top = ((bounds.size.height - STATUS_LINE_HEIGHT) / 2.0).max(0.0);
+    // ── 메뉴바 D6 단일 줄 ─────────────────────────────────────────────
+    fn draw_status_title(bounds: NSRect, title: &str) {
+        let color = NSColor::labelColor();
+        if title.contains('%') {
+            let big = mono_bold(D6_BIG);
+            let small = mono_bold(D6_PCT);
+            let attributed = mixed_pct(title, &big, &small, &color, NSTextAlignment(2));
+            let size = measure(&attributed);
+            let w = size.width.min(bounds.size.width);
+            let h = size.height;
+            let x = ((bounds.size.width - w) / 2.0).max(0.0);
+            let top = ((bounds.size.height - h) / 2.0).max(0.0);
+            let rect = rect_from_top(x, top, w + 1.0, h + 1.0, bounds);
+            attributed.drawWithRect_options_context(rect, draw_options(), None);
+        } else {
+            let font = NSFont::menuBarFontOfSize(STATUS_FONT_SIZE);
+            let line = STATUS_FONT_SIZE + 4.0;
+            let top = ((bounds.size.height - line) / 2.0).max(0.0);
             draw_text(
                 title,
                 0.0,
                 top,
                 bounds.size.width,
-                STATUS_LINE_HEIGHT,
+                line,
                 &font,
                 &color,
-                center,
-                bounds,
-            );
-            return;
-        }
-
-        let percents: Vec<&str> = lines[0].split_whitespace().collect();
-        let resets: Vec<&str> = lines[1].split_whitespace().collect();
-        let columns = percents.len().max(resets.len()).max(1);
-        let column_width = bounds.size.width / columns as f64;
-
-        // 2줄 블록이 메뉴바 높이를 넘으면 폰트/여백을 통째로 비례 축소해 잘림을 막는다.
-        // (상하 1px 씩 여유를 두고 맞춘다.)
-        let natural_block = PERCENT_LINE_HEIGHT + COLUMN_ROW_GAP + RESET_LINE_HEIGHT;
-        let available = (bounds.size.height - 2.0).max(1.0);
-        let scale = (available / natural_block).min(1.0);
-        let percent_line = PERCENT_LINE_HEIGHT * scale;
-        let reset_line = RESET_LINE_HEIGHT * scale;
-        let gap = COLUMN_ROW_GAP * scale;
-        let block_height = percent_line + gap + reset_line;
-        let top_margin = ((bounds.size.height - block_height) / 2.0).max(0.0);
-        let percent_font = status_font(PERCENT_FONT_SIZE * scale);
-        let reset_font = status_font(RESET_FONT_SIZE * scale);
-
-        for index in 0..columns {
-            let x = column_width * index as f64;
-            if let Some(percent) = percents.get(index) {
-                draw_centered_cell(
-                    percent,
-                    x,
-                    column_width,
-                    top_margin,
-                    percent_line,
-                    &percent_font,
-                    &color,
-                    bounds,
-                );
-            }
-            if let Some(reset) = resets.get(index) {
-                draw_centered_cell(
-                    reset,
-                    x,
-                    column_width,
-                    top_margin + percent_line + gap,
-                    reset_line,
-                    &reset_font,
-                    &color,
-                    bounds,
-                );
-            }
-        }
-    }
-
-    // 컬럼 폭 안에서 텍스트 실제 폭을 측정해 중앙에 직접 배치한다.
-    // NSTextAlignment center 는 폰트/글자수가 다른 두 줄 사이에 미세한 오차를 남기므로,
-    // 측정 기반으로 퍼센트/시간이 같은 기준에서 정확히 세로 정렬되도록 한다.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_centered_cell(
-        text: &str,
-        column_x: f64,
-        column_width: f64,
-        top: f64,
-        height: f64,
-        font: &Retained<NSFont>,
-        color: &NSColor,
-        bounds: NSRect,
-    ) {
-        let attributed = attributed_string(text, font, color, NSTextAlignment(0));
-        let options = NSStringDrawingOptions::UsesLineFragmentOrigin
-            | NSStringDrawingOptions::UsesFontLeading;
-        let measured = attributed.boundingRectWithSize_options_context(
-            NSSize::new(column_width, f64::INFINITY),
-            options,
-            None,
-        );
-        let text_width = measured.size.width.min(column_width);
-        let x = column_x + ((column_width - text_width) / 2.0).max(0.0);
-        let rect = rect_from_top(x, top, text_width + 1.0, height, bounds);
-        attributed.drawWithRect_options_context(rect, options, None);
-    }
-
-    fn draw_popover_content(bounds: NSRect, state: &NativePopoverState) {
-        let inset = 16.0;
-        let width = bounds.size.width;
-        let title_font = NSFont::boldSystemFontOfSize(13.0);
-        let body_font = NSFont::systemFontOfSize(13.0);
-        let small_font = NSFont::systemFontOfSize(11.0);
-        let value_font = NSFont::boldSystemFontOfSize(18.0);
-        let label = NSColor::labelColor();
-        let secondary = label.colorWithAlphaComponent(0.58);
-        let tertiary = label.colorWithAlphaComponent(0.38);
-        let separator = NSColor::separatorColor().colorWithAlphaComponent(0.72);
-        let section_fill = NSColor::colorWithWhite_alpha(1.0, 0.07);
-        let track = NSColor::colorWithWhite_alpha(1.0, 0.12);
-        let accent = NSColor::controlAccentColor().colorWithAlphaComponent(0.82);
-
-        draw_text(
-            "토큰 한도",
-            inset,
-            14.0,
-            120.0,
-            18.0,
-            &small_font,
-            &secondary,
-            NSTextAlignment(0),
-            bounds,
-        );
-        draw_text(
-            &state.updated_text,
-            width - 170.0,
-            14.0,
-            154.0,
-            18.0,
-            &small_font,
-            &tertiary,
-            NSTextAlignment(2),
-            bounds,
-        );
-
-        let source_section = rect_from_top(inset, 38.0, width - inset * 2.0, 146.0, bounds);
-        draw_rounded_rect(source_section, 14.0, &section_fill, Some(&separator));
-
-        let mut row_top = 50.0;
-        for (index, source) in state.sources.iter().enumerate() {
-            let icon_rect = rect_from_top(inset + 15.0, row_top + 15.0, 26.0, 16.0, bounds);
-            draw_rounded_rect(icon_rect, 5.0, &track, None);
-            let fill_width = (source.fraction.clamp(0.0, 1.0) * 26.0).max(3.0);
-            let icon_fill = NSRect::new(
-                icon_rect.origin,
-                NSSize::new(fill_width, icon_rect.size.height),
-            );
-            draw_rounded_rect(icon_fill, 5.0, &accent, None);
-
-            draw_text(
-                &source.label,
-                inset + 52.0,
-                row_top + 7.0,
-                180.0,
-                20.0,
-                &title_font,
-                &label,
-                NSTextAlignment(0),
-                bounds,
-            );
-            draw_text(
-                &source.percent_text,
-                width - inset - 76.0,
-                row_top + 7.0,
-                60.0,
-                20.0,
-                &title_font,
-                &label,
                 NSTextAlignment(2),
                 bounds,
             );
-
-            let meter_rect = rect_from_top(
-                inset + 52.0,
-                row_top + 34.0,
-                width - inset * 2.0 - 68.0,
-                5.0,
-                bounds,
-            );
-            draw_rounded_rect(meter_rect, 2.5, &track, None);
-            let meter_fill = NSRect::new(
-                meter_rect.origin,
-                NSSize::new(
-                    meter_rect.size.width * source.fraction.clamp(0.0, 1.0),
-                    meter_rect.size.height,
-                ),
-            );
-            draw_rounded_rect(meter_fill, 2.5, &accent, None);
-
-            draw_text(
-                &source.reset_text,
-                inset + 52.0,
-                row_top + 44.0,
-                width - inset * 2.0 - 68.0,
-                18.0,
-                &small_font,
-                &secondary,
-                NSTextAlignment(0),
-                bounds,
-            );
-
-            if index + 1 < state.sources.len() {
-                draw_separator(
-                    inset + 52.0,
-                    row_top + 70.0,
-                    width - inset * 2.0 - 52.0,
-                    &separator,
-                    bounds,
-                );
-            }
-            row_top += 72.0;
         }
+    }
 
-        let graph_top = 200.0;
+    // ── 펼친 패널(FinalPanel) ─────────────────────────────────────────
+    fn draw_popover_content(bounds: NSRect, state: &NativePopoverState) {
+        let width = bounds.size.width;
+        let pad = PANEL_PAD_X;
+        let label = NSColor::labelColor();
+        let section_font = status_font(11.0);
+        let section_color = label.colorWithAlphaComponent(0.45);
+
         draw_text(
-            "사용량 그래프",
-            inset,
-            graph_top,
-            120.0,
-            18.0,
-            &small_font,
-            &secondary,
+            "토큰 한도 · 잔량",
+            pad,
+            12.0,
+            width - pad * 2.0,
+            16.0,
+            &section_font,
+            &section_color,
             NSTextAlignment(0),
             bounds,
         );
+
+        let sources: Vec<&super::NativePopoverSourceState> = state.sources.iter().take(2).collect();
+        for (index, source) in sources.iter().enumerate() {
+            let row_top = ROWS_TOP + index as f64 * ROW_H;
+            draw_limit_row(bounds, width, row_top, source);
+            if index + 1 < sources.len() {
+                let div_y = ROWS_TOP + (index as f64 + 1.0) * ROW_H - 4.0;
+                draw_separator(
+                    pad,
+                    div_y,
+                    width - pad * 2.0,
+                    &label.colorWithAlphaComponent(0.10),
+                    bounds,
+                );
+            }
+        }
+
+        let rows_bottom = ROWS_TOP + sources.len() as f64 * ROW_H;
         draw_text(
-            "Last 24 hours",
-            inset,
-            graph_top + 24.0,
+            "표시 정보 설정",
+            pad,
+            rows_bottom + 12.0,
+            width - pad * 2.0,
+            16.0,
+            &section_font,
+            &section_color,
+            NSTextAlignment(0),
+            bounds,
+        );
+
+        for (index, source) in sources.iter().enumerate() {
+            let top = TOGGLES_TOP + index as f64 * TOGGLE_ROW_H;
+            draw_toggle_row(bounds, width, top, source);
+        }
+    }
+
+    fn draw_limit_row(
+        bounds: NSRect,
+        width: f64,
+        row_top: f64,
+        source: &super::NativePopoverSourceState,
+    ) {
+        let pad = PANEL_PAD_X;
+        let factor = if source.enabled { 1.0 } else { 0.4 };
+        let label = NSColor::labelColor();
+        let status = status_color(source.remaining, source.has_percent);
+        let heading_top = row_top + 9.0;
+
+        // 상태 점
+        let dot_rect = rect_from_top(pad, heading_top + 6.0, 8.0, 8.0, bounds);
+        draw_rounded_rect(dot_rect, 4.0, &status.colorWithAlphaComponent(factor), None);
+
+        // 서비스명
+        let name_font = NSFont::boldSystemFontOfSize(14.0);
+        draw_text(
+            &source.label,
+            pad + 15.0,
+            heading_top,
+            150.0,
+            20.0,
+            &name_font,
+            &label.colorWithAlphaComponent(factor),
+            NSTextAlignment(0),
+            bounds,
+        );
+
+        // 큰 퍼센트 (상태색) + 작은 %
+        let big = mono_bold(17.0);
+        let small = mono_bold(11.0);
+        let pct = mixed_pct(
+            &source.percent_text,
+            &big,
+            &small,
+            &status.colorWithAlphaComponent(factor),
+            NSTextAlignment(0),
+        );
+        let pct_size = measure(&pct);
+        let pct_x = width - pad - pct_size.width;
+        let pct_center = heading_top + 10.0;
+        let pct_rect = rect_from_top(
+            pct_x,
+            pct_center - pct_size.height / 2.0,
+            pct_size.width + 1.0,
+            pct_size.height + 1.0,
+            bounds,
+        );
+        pct.drawWithRect_options_context(pct_rect, draw_options(), None);
+
+        // 게이지
+        let meter_top = heading_top + 28.0;
+        let meter_w = width - pad * 2.0;
+        let track_rect = rect_from_top(pad, meter_top, meter_w, 6.0, bounds);
+        draw_rounded_rect(
+            track_rect,
+            3.0,
+            &label.colorWithAlphaComponent(0.12 * factor),
+            None,
+        );
+        let fill_w = (source.fraction.clamp(0.0, 1.0) * meter_w).max(0.0);
+        if fill_w > 0.5 {
+            let fill_rect = rect_from_top(pad, meter_top, fill_w, 6.0, bounds);
+            draw_rounded_rect(fill_rect, 3.0, &status.colorWithAlphaComponent(factor), None);
+        }
+
+        // 다음 갱신까지
+        let detail_top = meter_top + 13.0;
+        let detail_color = label.colorWithAlphaComponent(0.55 * factor);
+        if source.has_reset {
+            let body_font = NSFont::systemFontOfSize(12.0);
+            let mono_font = status_font(12.0);
+            draw_text(
+                "다음 갱신까지",
+                pad,
+                detail_top,
+                140.0,
+                16.0,
+                &body_font,
+                &detail_color,
+                NSTextAlignment(0),
+                bounds,
+            );
+            draw_text(
+                &source.detail,
+                width - pad - 200.0,
+                detail_top,
+                200.0,
+                16.0,
+                &mono_font,
+                &detail_color,
+                NSTextAlignment(2),
+                bounds,
+            );
+        } else {
+            let body_font = NSFont::systemFontOfSize(12.0);
+            draw_text(
+                &source.detail,
+                pad,
+                detail_top,
+                width - pad * 2.0,
+                16.0,
+                &body_font,
+                &detail_color,
+                NSTextAlignment(0),
+                bounds,
+            );
+        }
+    }
+
+    fn draw_toggle_row(
+        bounds: NSRect,
+        width: f64,
+        top: f64,
+        source: &super::NativePopoverSourceState,
+    ) {
+        let pad = PANEL_PAD_X;
+        let label = NSColor::labelColor();
+        let status = status_color(source.remaining, source.has_percent);
+
+        let dot_rect = rect_from_top(pad, top + 16.0, 8.0, 8.0, bounds);
+        draw_rounded_rect(dot_rect, 4.0, &status, None);
+
+        let name_font = NSFont::systemFontOfSize(13.5);
+        draw_text(
+            &source.label,
+            pad + 15.0,
+            top + 10.0,
             160.0,
-            22.0,
-            &title_font,
+            20.0,
+            &name_font,
             &label,
             NSTextAlignment(0),
             bounds,
         );
-        draw_text(
-            "Claude 로컬 추정 · Codex 공식 관측",
-            width - 160.0,
-            graph_top + 24.0,
-            144.0,
-            20.0,
-            &small_font,
-            &tertiary,
-            NSTextAlignment(2),
-            bounds,
-        );
-        let graph_rect = rect_from_top(inset, graph_top + 56.0, width - inset * 2.0, 112.0, bounds);
-        draw_rounded_rect(graph_rect, 14.0, &section_fill, Some(&separator));
-        draw_chart_placeholder(graph_rect, &accent, &separator);
 
-        let rollup_top = 332.0;
-        let rollup_rect = rect_from_top(inset, rollup_top, width - inset * 2.0, 76.0, bounds);
-        draw_rounded_rect(rollup_rect, 14.0, &section_fill, Some(&separator));
-        let cell_w = rollup_rect.size.width / 3.0;
-        let rollups = [
-            ("Today", &state.rollup_day),
-            ("This week", &state.rollup_week),
-            ("This month", &state.rollup_month),
-        ];
-        for (index, (name, value)) in rollups.iter().enumerate() {
-            let x = inset + cell_w * index as f64;
-            if index > 0 {
-                draw_vertical_separator(x, rollup_top, 76.0, &separator, bounds);
-            }
-            draw_text(
-                name,
-                x + 12.0,
-                rollup_top + 16.0,
-                cell_w - 24.0,
-                18.0,
-                &body_font,
-                &secondary,
-                NSTextAlignment(0),
-                bounds,
-            );
-            draw_text(
-                value,
-                x + 12.0,
-                rollup_top + 44.0,
-                cell_w - 24.0,
-                24.0,
-                &value_font,
-                &label,
-                NSTextAlignment(0),
-                bounds,
-            );
+        let toggle_x = width - pad - TOGGLE_W;
+        draw_toggle(bounds, toggle_x, top + 8.0, source.enabled);
+    }
+
+    fn draw_toggle(bounds: NSRect, x: f64, top: f64, on: bool) {
+        let track_rect = rect_from_top(x, top, TOGGLE_W, TOGGLE_H, bounds);
+        let track_color = if on {
+            srgb(0x46, 0xa8, 0x6b)
+        } else {
+            NSColor::labelColor().colorWithAlphaComponent(0.20)
+        };
+        draw_rounded_rect(track_rect, TOGGLE_H / 2.0, &track_color, None);
+
+        let knob = 20.0;
+        let knob_x = if on {
+            x + TOGGLE_W - 2.0 - knob
+        } else {
+            x + 2.0
+        };
+        let knob_rect = rect_from_top(knob_x, top + 2.0, knob, knob, bounds);
+        draw_rounded_rect(knob_rect, knob / 2.0, &NSColor::whiteColor(), None);
+    }
+
+    fn toggle_hit_rect(index: usize, width: f64) -> (f64, f64, f64, f64) {
+        let top = TOGGLES_TOP + index as f64 * TOGGLE_ROW_H + 8.0;
+        (width - PANEL_PAD_X - TOGGLE_W, top, TOGGLE_W, TOGGLE_H)
+    }
+
+    // 잔량 → 상태색. 여유는 시스템 라벨색(메뉴바에서 안 튐), 낮을수록 경고색.
+    fn status_color(remaining: u8, has_percent: bool) -> Retained<NSColor> {
+        if !has_percent {
+            return NSColor::labelColor();
+        }
+        if remaining < 15 {
+            srgb(0xa8, 0x3f, 0x2a)
+        } else if remaining < 35 {
+            srgb(0xb8, 0x7a, 0x3a)
+        } else {
+            NSColor::labelColor()
         }
     }
 
-    fn draw_chart_placeholder(rect: NSRect, accent: &NSColor, separator: &NSColor) {
-        separator.setStroke();
-        let base_y = rect.origin.y + 24.0;
-        for i in 0..4 {
-            let y = base_y + i as f64 * 20.0;
-            NSBezierPath::strokeLineFromPoint_toPoint(
-                NSPoint::new(rect.origin.x + 14.0, y),
-                NSPoint::new(rect.origin.x + rect.size.width - 14.0, y),
-            );
-        }
+    fn srgb(r: u8, g: u8, b: u8) -> Retained<NSColor> {
+        NSColor::colorWithSRGBRed_green_blue_alpha(
+            f64::from(r) / 255.0,
+            f64::from(g) / 255.0,
+            f64::from(b) / 255.0,
+            1.0,
+        )
+    }
 
-        accent.setStroke();
-        let line = NSBezierPath::bezierPath();
-        line.setLineWidth(2.0);
-        line.moveToPoint(NSPoint::new(rect.origin.x + 18.0, rect.origin.y + 35.0));
-        line.lineToPoint(NSPoint::new(rect.origin.x + 74.0, rect.origin.y + 48.0));
-        line.lineToPoint(NSPoint::new(rect.origin.x + 132.0, rect.origin.y + 41.0));
-        line.lineToPoint(NSPoint::new(rect.origin.x + 206.0, rect.origin.y + 72.0));
-        line.lineToPoint(NSPoint::new(
-            rect.origin.x + rect.size.width - 20.0,
-            rect.origin.y + 58.0,
-        ));
-        line.stroke();
+    fn draw_options() -> NSStringDrawingOptions {
+        NSStringDrawingOptions::UsesLineFragmentOrigin | NSStringDrawingOptions::UsesFontLeading
+    }
+
+    fn measure(attributed: &NSAttributedString) -> NSSize {
+        attributed
+            .boundingRectWithSize_options_context(
+                NSSize::new(f64::INFINITY, f64::INFINITY),
+                draw_options(),
+                None,
+            )
+            .size
+    }
+
+    // 큰 숫자 + 작은 % 한 덩어리. base(큰 폰트)에 '%' 글자에만 작은 폰트를 덧씌운다.
+    fn mixed_pct(
+        text: &str,
+        big: &Retained<NSFont>,
+        small: &Retained<NSFont>,
+        color: &NSColor,
+        alignment: NSTextAlignment,
+    ) -> Retained<NSMutableAttributedString> {
+        let base = attributed_string(text, big, color, alignment);
+        let attributed: Retained<NSMutableAttributedString> = unsafe {
+            objc2::msg_send![NSMutableAttributedString::alloc(), initWithAttributedString: &*base]
+        };
+        let mut utf16_index = 0usize;
+        for ch in text.chars() {
+            let len = ch.len_utf16();
+            if ch == '%' {
+                let range = NSRange::new(utf16_index, len);
+                unsafe {
+                    let _: () = objc2::msg_send![
+                        &*attributed,
+                        addAttribute: NSFontAttributeName,
+                        value: &**small,
+                        range: range
+                    ];
+                }
+            }
+            utf16_index += len;
+        }
+        attributed
     }
 
     fn rect_from_top(x: f64, top: f64, width: f64, height: f64, bounds: NSRect) -> NSRect {
@@ -597,12 +644,7 @@ mod macos {
     ) {
         let rect = rect_from_top(x, top, width, height, bounds);
         let string = attributed_string(text, font, color, alignment);
-        string.drawWithRect_options_context(
-            rect,
-            NSStringDrawingOptions::UsesLineFragmentOrigin
-                | NSStringDrawingOptions::UsesFontLeading,
-            None,
-        );
+        string.drawWithRect_options_context(rect, draw_options(), None);
     }
 
     fn attributed_string(
@@ -649,12 +691,6 @@ mod macos {
         NSBezierPath::strokeLineFromPoint_toPoint(NSPoint::new(x, y), NSPoint::new(x + width, y));
     }
 
-    fn draw_vertical_separator(x: f64, top: f64, height: f64, color: &NSColor, bounds: NSRect) {
-        color.setStroke();
-        let y = bounds.size.height - top - height;
-        NSBezierPath::strokeLineFromPoint_toPoint(NSPoint::new(x, y), NSPoint::new(x, y + height));
-    }
-
     pub fn anchor_rect_on_main() -> Option<NativeStatusAnchor> {
         STATUS_STATE.with(|cell| {
             let state = cell.borrow();
@@ -675,35 +711,33 @@ mod macos {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativePopoverSourceState {
     pub label: String,
+    /// 큰 숫자로 그릴 텍스트. 예: "12%", "~84%", "--".
     pub percent_text: String,
-    pub reset_text: String,
+    /// 잔량(%). 상태색/게이지 계산용. has_percent=false면 0.
+    pub remaining: u8,
+    pub has_percent: bool,
+    /// "2시간 10분 · 오후 7:20" 또는 상태 메시지.
+    pub detail: String,
+    pub has_reset: bool,
     pub fraction: f64,
+    pub enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct NativePopoverState {
+    /// 항상 [클로드코드, 코덱스] 순서. 토글 off여도 흐리게 표시.
     pub sources: Vec<NativePopoverSourceState>,
-    pub rollup_day: String,
-    pub rollup_week: String,
-    pub rollup_month: String,
-    pub updated_text: String,
-}
-
-impl Default for NativePopoverState {
-    fn default() -> Self {
-        Self {
-            sources: Vec::new(),
-            rollup_day: "--".to_string(),
-            rollup_week: "--".to_string(),
-            rollup_month: "--".to_string(),
-            updated_text: "--".to_string(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeStatusClick {
     OpenPopover,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativePopoverAction {
+    /// 메뉴바 표시 토글. 0 = 클로드코드, 1 = 코덱스.
+    ToggleSource(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -719,15 +753,17 @@ pub fn install_initial<R: tauri::Runtime>(
     title: String,
     tooltip: String,
     click_sender: std::sync::mpsc::Sender<NativeStatusClick>,
+    action_sender: std::sync::mpsc::Sender<NativePopoverAction>,
 ) {
     #[cfg(target_os = "macos")]
     {
-        let _ =
-            app.run_on_main_thread(move || macos::install_on_main(&title, &tooltip, click_sender));
+        let _ = app.run_on_main_thread(move || {
+            macos::install_on_main(&title, &tooltip, click_sender, action_sender)
+        });
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (app, title, tooltip, click_sender);
+        let _ = (app, title, tooltip, click_sender, action_sender);
     }
 }
 
