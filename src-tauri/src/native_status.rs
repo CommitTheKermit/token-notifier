@@ -22,10 +22,14 @@ mod macos {
     use std::sync::mpsc::Sender;
 
     // 메뉴바(D6): 단일 줄 `12% 84%`. 큰 숫자 + 작은 % (위치로만 클로드코드/코덱스 구분).
-    const STATUS_ITEM_WIDTH: f64 = 70.0;
+    // 항목 폭은 표시 텍스트에 맞춰 동적으로 정한다(토글로 한쪽을 끄면 빈 공간 없이 줄어듦).
     const STATUS_FONT_SIZE: f64 = 13.0;
     const D6_BIG: f64 = 13.0;
     const D6_PCT: f64 = 9.0;
+    // 텍스트 좌우 여백 합. 측정 폭에 더해 항목 폭을 정한다.
+    const STATUS_ITEM_PADDING: f64 = 14.0;
+    const STATUS_ITEM_MIN_WIDTH: f64 = 30.0;
+    const STATUS_ITEM_MAX_WIDTH: f64 = 160.0;
 
     // 펼친 패널(FinalPanel) 레이아웃 상수 (top-origin 거리).
     const POPOVER_WIDTH: f64 = 296.0;
@@ -164,13 +168,14 @@ mod macos {
         STATUS_STATE.with(|cell| {
             if cell.borrow().is_none() {
                 let status_bar = NSStatusBar::systemStatusBar();
-                let item = status_bar.statusItemWithLength(STATUS_ITEM_WIDTH);
+                let width = status_item_width(initial_title);
+                let item = status_bar.statusItemWithLength(width);
                 item.setVisible(true);
-                item.setLength(STATUS_ITEM_WIDTH);
+                item.setLength(width);
 
                 let frame = NSRect::new(
                     NSPoint::new(0.0, 0.0),
-                    NSSize::new(STATUS_ITEM_WIDTH, status_bar.thickness()),
+                    NSSize::new(width, status_bar.thickness()),
                 );
                 let view = mtm.alloc().set_ivars(StatusViewIvars {
                     sender,
@@ -201,11 +206,35 @@ mod macos {
     pub fn update_title_on_main(title: &str, tooltip: &str) {
         STATUS_STATE.with(|cell| {
             if let Some(state) = cell.borrow().as_ref() {
+                let width = status_item_width(title);
                 state.item.setVisible(true);
-                state.item.setLength(STATUS_ITEM_WIDTH);
+                state.item.setLength(width);
+                // 항목 폭이 바뀌어도 커스텀 뷰의 프레임은 자동으로 따라오지 않으므로
+                // 직접 맞춰줘야 drawRect가 새 폭 안에서 중앙정렬한다.
+                let thickness = NSStatusBar::systemStatusBar().thickness();
+                state.view.setFrame(NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(width, thickness),
+                ));
                 set_status_title(&state.view, title, tooltip);
             }
         });
+    }
+
+    // 표시 텍스트 폭을 측정해 항목 폭을 정한다. 토글로 숫자가 줄면 폭도 함께 줄어든다.
+    fn status_item_width(title: &str) -> f64 {
+        let color = NSColor::labelColor();
+        let text_width = if title.contains('%') {
+            let big = mono_bold(D6_BIG);
+            let small = mono_bold(D6_PCT);
+            let attributed = mixed_pct(title, &big, &small, &color, NSTextAlignment(2));
+            measure(&attributed).width
+        } else {
+            let font = NSFont::menuBarFontOfSize(STATUS_FONT_SIZE);
+            let attributed = attributed_string(title, &font, &color, NSTextAlignment(2));
+            measure(&attributed).width
+        };
+        (text_width + STATUS_ITEM_PADDING).clamp(STATUS_ITEM_MIN_WIDTH, STATUS_ITEM_MAX_WIDTH)
     }
 
     pub fn update_popover_on_main(popover_state: NativePopoverState) {
