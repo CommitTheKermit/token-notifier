@@ -590,14 +590,10 @@ mod macos {
         let pad = PANEL_PAD_X;
         let label = NSColor::labelColor();
 
-        // 토글 점은 잔량색이 아니라 서비스 구분색(고정)으로 어느 서비스인지 식별만 한다.
-        let dot_rect = rect_from_top(pad, top + 16.0, 8.0, 8.0, bounds);
-        draw_rounded_rect(dot_rect, 4.0, &service_color(index), None);
-
         let name_font = NSFont::systemFontOfSize(13.5);
         draw_text(
             &source.label,
-            pad + 15.0,
+            pad,
             top + 10.0,
             160.0,
             20.0,
@@ -607,14 +603,16 @@ mod macos {
             bounds,
         );
 
+        // 토글 ON 색은 서비스 구분색(클로드코드=따뜻함, 코덱스=차가움)으로 어느 서비스의
+        // 표시를 켜고 있는지 한눈에 보이게 한다.
         let toggle_x = width - pad - TOGGLE_W;
-        draw_toggle(bounds, toggle_x, top + 8.0, source.enabled);
+        draw_toggle(bounds, toggle_x, top + 8.0, source.enabled, &service_color(index));
     }
 
-    fn draw_toggle(bounds: NSRect, x: f64, top: f64, on: bool) {
+    fn draw_toggle(bounds: NSRect, x: f64, top: f64, on: bool, on_color: &NSColor) {
         let track_rect = rect_from_top(x, top, TOGGLE_W, TOGGLE_H, bounds);
         let track_color = if on {
-            srgb(0x46, 0xa8, 0x6b)
+            on_color.retain()
         } else {
             NSColor::labelColor().colorWithAlphaComponent(0.20)
         };
