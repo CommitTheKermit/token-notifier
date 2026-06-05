@@ -212,12 +212,8 @@ mod macos {
                 ));
                 set_status_title(&state.view, title, tooltip);
 
-                // 폭이 바뀌면 아이콘 위치가 이동하므로, 열려 있는 패널을 새 위치로 옮긴다.
-                if let Some(panel) = state.panel.borrow().as_ref() {
-                    if let Some(origin) = panel_origin(&state.view) {
-                        panel.setFrameOrigin(origin);
-                    }
-                }
+                // 패널은 열린 위치에 고정한다. 폭이 바뀌어도(토글로 메뉴바 항목이 줄어도)
+                // 떠 있는 패널은 재배치하지 않아 제자리에 머문다.
             }
         });
     }
