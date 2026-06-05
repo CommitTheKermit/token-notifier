@@ -10,10 +10,26 @@ use crate::storage::UsageStore;
 use crate::tray::{update_main_tray, TrayDisplayState};
 use crate::window_estimator::WindowEstimator;
 use chrono::{Duration as ChronoDuration, Utc};
+use std::sync::{Arc, OnceLock};
 use tauri::{AppHandle, Emitter};
+use tokio::sync::Notify;
 use tokio::time::{self, Duration};
 
 const CODEX_RATE_LIMIT_FRESHNESS_SECS: i64 = 5 * 60;
+
+// 폴링 루프를 즉시 한 번 깨우는 트리거. 토글을 켜는 등 설정 변경 직후 다음 주기를
+// 기다리지 않고 바로 데이터를 로딩하는 데 쓴다.
+static REFRESH_NOTIFY: OnceLock<Arc<Notify>> = OnceLock::new();
+
+fn refresh_notify() -> Arc<Notify> {
+    REFRESH_NOTIFY
+        .get_or_init(|| Arc::new(Notify::new()))
+        .clone()
+}
+
+pub fn request_immediate_refresh() {
+    refresh_notify().notify_one();
+}
 
 pub fn start_background_runtime<R: tauri::Runtime>(app: AppHandle<R>) -> anyhow::Result<()> {
     let db_path =
@@ -29,11 +45,15 @@ pub fn start_background_runtime<R: tauri::Runtime>(app: AppHandle<R>) -> anyhow:
     );
 
     let app_for_remote_sync = app.clone();
+    let refresh = refresh_notify();
     tauri::async_runtime::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(MIN_POLL_INTERVAL_SECS));
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = refresh.notified() => {}
+            }
             let enabled = load_settings();
             match scheduler.poll_once(|source| source_enabled(&enabled, source)) {
                 Ok(Some(outcome)) => {

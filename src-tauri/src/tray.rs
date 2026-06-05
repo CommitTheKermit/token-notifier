@@ -201,6 +201,8 @@ fn apply_source_toggle<R: tauri::Runtime>(app: &tauri::AppHandle<R>, index: usiz
     };
     settings.claude_code.enabled = cc_enabled;
     settings.codex.enabled = cx_enabled;
+    // 이번 토글로 막 켜진 소스가 있으면(끔->켬) 곧바로 한 번 로딩한다.
+    let newly_enabled = (index == 0 && cc_enabled) || (index == 1 && cx_enabled);
     let saved = crate::settings::save_settings(&settings).unwrap_or(settings);
 
     let mut state = latest_display_state();
@@ -216,6 +218,11 @@ fn apply_source_toggle<R: tauri::Runtime>(app: &tauri::AppHandle<R>, index: usiz
     let _ = update_main_tray(app, &state);
     let _ = app.emit("settings-reloaded", &saved);
     let _ = app.emit("usage-update", &state);
+
+    // 켠 경우: 폴링 루프를 즉시 깨워 다음 주기를 기다리지 않고 바로 값을 채운다.
+    if newly_enabled {
+        crate::runtime::request_immediate_refresh();
+    }
 }
 
 pub fn update_main_tray<R: tauri::Runtime>(
