@@ -217,6 +217,18 @@ mod macos {
                     NSSize::new(width, thickness),
                 ));
                 set_status_title(&state.view, title, tooltip);
+
+                // 폭이 줄면 메뉴바에서 아이콘 위치가 이동한다. 이미 열려 있는 팝오버는
+                // 그대로 남아 화살표가 어긋나므로, 새 아이콘 위치로 다시 앵커링한다.
+                if let Some(popover) = state.popover.borrow().as_ref() {
+                    if popover.isShown() {
+                        popover.showRelativeToRect_ofView_preferredEdge(
+                            state.view.bounds(),
+                            &state.view,
+                            NSRectEdge::MinY,
+                        );
+                    }
+                }
             }
         });
     }
