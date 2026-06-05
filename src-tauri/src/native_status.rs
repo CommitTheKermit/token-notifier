@@ -10,15 +10,14 @@ mod macos {
     use objc2_app_kit::NSAttributedStringNSExtendedStringDrawing;
     use objc2_app_kit::{
         NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSEventMask, NSFont,
-        NSFontAttributeName, NSFontWeight, NSForegroundColorAttributeName, NSImage,
-        NSImageResizingMode, NSLineBreakMode, NSMutableParagraphStyle, NSPanel,
-        NSParagraphStyleAttributeName, NSStatusBar, NSStatusItem, NSStringDrawingOptions,
-        NSTextAlignment, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-        NSVisualEffectState, NSVisualEffectView, NSWindowStyleMask,
+        NSFontAttributeName, NSFontWeight, NSForegroundColorAttributeName, NSLineBreakMode,
+        NSMutableParagraphStyle, NSPanel, NSParagraphStyleAttributeName, NSStatusBar, NSStatusItem,
+        NSStringDrawingOptions, NSTextAlignment, NSView, NSVisualEffectBlendingMode,
+        NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowStyleMask,
     };
     use objc2_foundation::NSMutableAttributedString;
     use objc2_foundation::{
-        NSAttributedString, NSDictionary, NSEdgeInsets, NSPoint, NSRange, NSRect, NSSize, NSString,
+        NSAttributedString, NSDictionary, NSPoint, NSRange, NSRect, NSSize, NSString,
     };
     use std::cell::RefCell;
     use std::ptr::NonNull;
@@ -275,24 +274,26 @@ mod macos {
             let popover_view: Retained<PopoverView> =
                 unsafe { objc2::msg_send![super(popover_view), initWithFrame: content_frame] };
 
-            // 블러 + 둥근 모서리 컨테이너.
+            // 블러 재질 뷰. 자기 layer cornerRadius만으로는 일부 모서리에서 재질이
+            // 비어져 나오므로(특히 하단), 둥근 plain 컨테이너 뷰 안에 넣어 부모가 클립한다.
             let effect =
                 NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), content_frame);
             effect.setMaterial(NSVisualEffectMaterial::Popover);
             effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
             effect.setState(NSVisualEffectState::Active);
-            // 블러 재질은 layer cornerRadius만으로는 모서리에서 클립되지 않아(사각 재질이
-            // 비어져 나온다) 둥근 사각 maskImage로 마스킹한다. 서브뷰는 layer로 함께 클립.
+            effect.addSubview(&popover_view);
+
+            // 둥근 모서리 클립 컨테이너(plain NSView). masksToBounds로 블러+콘텐츠를 함께 클립.
+            let container = NSView::initWithFrame(NSView::alloc(mtm), content_frame);
             unsafe {
-                let _: () = objc2::msg_send![&*effect, setWantsLayer: true];
-                let layer: *mut AnyObject = objc2::msg_send![&*effect, layer];
+                let _: () = objc2::msg_send![&*container, setWantsLayer: true];
+                let layer: *mut AnyObject = objc2::msg_send![&*container, layer];
                 if !layer.is_null() {
                     let _: () = objc2::msg_send![layer, setCornerRadius: 14.0_f64];
                     let _: () = objc2::msg_send![layer, setMasksToBounds: true];
                 }
             }
-            effect.setMaskImage(Some(&rounded_mask_image(14.0)));
-            effect.addSubview(&popover_view);
+            container.addSubview(&effect);
 
             // 화살표 없는 borderless 비활성 패널.
             let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
@@ -309,7 +310,7 @@ mod macos {
             panel.setLevel(PANEL_LEVEL);
             panel.setFloatingPanel(true);
             panel.setHidesOnDeactivate(false);
-            panel.setContentView(Some(&effect));
+            panel.setContentView(Some(&container));
 
             if let Some(origin) = panel_origin(&state.view) {
                 panel.setFrameOrigin(origin);
@@ -363,29 +364,6 @@ mod macos {
             right - POPOVER_WIDTH,
             item_bottom - POPOVER_HEIGHT - PANEL_GAP,
         ))
-    }
-
-    // 둥근 사각 마스크 이미지. 가운데를 늘리는 cap inset을 줘서 어떤 크기에도 모서리
-    // 반경이 유지된다. NSVisualEffectView.maskImage로 쓰면 블러 재질이 둥글게 잘린다.
-    #[allow(deprecated)] // lockFocus/unlockFocus: 작은 마스크 비트맵 1회 생성엔 충분.
-    fn rounded_mask_image(radius: f64) -> Retained<NSImage> {
-        let edge = radius * 2.0 + 2.0;
-        let size = NSSize::new(edge, edge);
-        let image = NSImage::initWithSize(NSImage::alloc(), size);
-        let rect = NSRect::new(NSPoint::new(0.0, 0.0), size);
-        image.lockFocus();
-        let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, radius, radius);
-        NSColor::blackColor().setFill();
-        path.fill();
-        image.unlockFocus();
-        image.setCapInsets(NSEdgeInsets {
-            top: radius,
-            left: radius,
-            bottom: radius,
-            right: radius,
-        });
-        image.setResizingMode(NSImageResizingMode::Stretch);
-        image
     }
 
     fn set_status_title(view: &StatusView, title: &str, tooltip: &str) {
