@@ -162,13 +162,33 @@ pub fn build_main_tray(app: &App) -> tauri::Result<()> {
 
 // 펼친 패널의 '표시 정보 설정' 토글: 해당 서비스의 메뉴바 표시 여부를 settings에 저장하고
 // 메뉴바/팝오버를 즉시 갱신한다. 끄면 메뉴바에서 사라지고 패널 행은 흐려진다.
+// 둘 중 하나는 반드시 켜져 있어야 한다. (cc, cx) 표시 여부에서 index 토글을 적용한
+// 결과를 돌려준다. 마지막으로 켜진 토글을 끄려는 동작이면 None(변화 없음).
+fn toggled_enabled(cc: bool, cx: bool, index: usize) -> Option<(bool, bool)> {
+    let (target_on, other_on) = match index {
+        0 => (cc, cx),
+        1 => (cx, cc),
+        _ => return None,
+    };
+    if target_on && !other_on {
+        return None;
+    }
+    match index {
+        0 => Some((!cc, cx)),
+        1 => Some((cc, !cx)),
+        _ => None,
+    }
+}
+
 fn apply_source_toggle<R: tauri::Runtime>(app: &tauri::AppHandle<R>, index: usize) {
     let mut settings = crate::settings::load_settings();
-    match index {
-        0 => settings.claude_code.enabled = !settings.claude_code.enabled,
-        1 => settings.codex.enabled = !settings.codex.enabled,
-        _ => return,
-    }
+    let Some((cc_enabled, cx_enabled)) =
+        toggled_enabled(settings.claude_code.enabled, settings.codex.enabled, index)
+    else {
+        return;
+    };
+    settings.claude_code.enabled = cc_enabled;
+    settings.codex.enabled = cx_enabled;
     let saved = crate::settings::save_settings(&settings).unwrap_or(settings);
 
     let mut state = latest_display_state();
@@ -439,6 +459,19 @@ mod tests {
         assert!(source.has_percent);
         assert!(source.has_reset);
         assert!(source.detail.starts_with("2시간 10분 · "));
+    }
+
+    #[test]
+    fn toggle_keeps_at_least_one_source_enabled() {
+        // 둘 다 켜진 상태에서 하나 끄기는 허용.
+        assert_eq!(toggled_enabled(true, true, 0), Some((false, true)));
+        assert_eq!(toggled_enabled(true, true, 1), Some((true, false)));
+        // 마지막으로 켜진 토글 끄기는 무시(변화 없음).
+        assert_eq!(toggled_enabled(true, false, 0), None);
+        assert_eq!(toggled_enabled(false, true, 1), None);
+        // 꺼진 토글 켜기는 항상 허용.
+        assert_eq!(toggled_enabled(true, false, 1), Some((true, true)));
+        assert_eq!(toggled_enabled(false, true, 0), Some((true, true)));
     }
 
     #[test]
