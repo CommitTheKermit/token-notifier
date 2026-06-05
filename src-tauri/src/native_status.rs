@@ -223,7 +223,7 @@ mod macos {
                 if let Some(popover) = state.popover.borrow().as_ref() {
                     if popover.isShown() {
                         popover.showRelativeToRect_ofView_preferredEdge(
-                            state.view.bounds(),
+                            popover_anchor_rect(&state.view),
                             &state.view,
                             NSRectEdge::MinY,
                         );
@@ -320,11 +320,23 @@ mod macos {
             NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
 
             popover.showRelativeToRect_ofView_preferredEdge(
-                state.view.bounds(),
+                popover_anchor_rect(&state.view),
                 &state.view,
                 NSRectEdge::MinY,
             );
         });
+    }
+
+    // 팝오버 화살표 앵커. 항목 폭이 줄면 왼쪽으로 줄어들어 중심은 이동하지만
+    // 오른쪽 모서리는 메뉴바에서 위치가 안정적이다. 오른쪽 가장자리에 화살표를
+    // 고정해 토글로 폭이 바뀌어도 화살표가 흔들리지 않게 한다(디자인의 우측 정렬 의도).
+    fn popover_anchor_rect(view: &StatusView) -> NSRect {
+        let bounds = view.bounds();
+        let width = 1.0;
+        NSRect::new(
+            NSPoint::new(bounds.size.width - width, bounds.origin.y),
+            NSSize::new(width, bounds.size.height),
+        )
     }
 
     fn set_status_title(view: &StatusView, title: &str, tooltip: &str) {
