@@ -228,6 +228,10 @@ impl ClaudeCodeParser {
 }
 
 impl LocalLogParser for ClaudeCodeParser {
+    fn source(&self) -> UsageSource {
+        UsageSource::ClaudeCode
+    }
+
     fn read_delta(&mut self) -> anyhow::Result<Vec<UsageEvent>> {
         self.load_state_if_needed()?;
         let mut events = Vec::new();

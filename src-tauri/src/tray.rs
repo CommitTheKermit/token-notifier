@@ -30,6 +30,18 @@ pub struct SourceTrayState {
     pub status_message: Option<String>,
 }
 
+impl SourceTrayState {
+    // 표시를 끈 소스: 잔량/갱신/관측값을 비우고 '표시 꺼짐' 기본 상태로 만든다.
+    pub fn reset_disabled(&mut self) {
+        self.percent_used = None;
+        self.reset_at = None;
+        self.estimated = false;
+        self.observed_at = None;
+        self.status_source = Some("disabled".to_string());
+        self.status_message = Some("표시 꺼짐".to_string());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrayDisplayState {
     pub cc: SourceTrayState,
@@ -194,6 +206,13 @@ fn apply_source_toggle<R: tauri::Runtime>(app: &tauri::AppHandle<R>, index: usiz
     let mut state = latest_display_state();
     state.cc.enabled = saved.claude_code.enabled;
     state.cx.enabled = saved.codex.enabled;
+    // 끄는 즉시 해당 소스 데이터를 비워 기본 상태로 보이게 한다(폴링은 다음 주기부터 중단).
+    if !state.cc.enabled {
+        state.cc.reset_disabled();
+    }
+    if !state.cx.enabled {
+        state.cx.reset_disabled();
+    }
     let _ = update_main_tray(app, &state);
     let _ = app.emit("settings-reloaded", &saved);
     let _ = app.emit("usage-update", &state);

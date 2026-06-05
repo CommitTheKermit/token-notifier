@@ -158,6 +158,10 @@ impl CodexParser {
 }
 
 impl LocalLogParser for CodexParser {
+    fn source(&self) -> UsageSource {
+        UsageSource::Codex
+    }
+
     fn read_delta(&mut self) -> anyhow::Result<Vec<UsageEvent>> {
         if !CODEX_LOCAL_ACCOUNTING_ENABLED {
             return Ok(Vec::new());

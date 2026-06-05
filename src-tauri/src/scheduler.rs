@@ -1,4 +1,4 @@
-use crate::parser::{LocalLogParser, UsageEvent};
+use crate::parser::{LocalLogParser, UsageEvent, UsageSource};
 use crate::storage::UsageStore;
 use crate::window_estimator::{UsageSnapshot, WindowEstimator};
 use chrono::{DateTime, Utc};
@@ -52,10 +52,17 @@ impl UsageScheduler {
         self.estimator.current_snapshots()
     }
 
-    pub fn poll_once(&mut self) -> anyhow::Result<Option<PollOutcome>> {
+    pub fn poll_once(
+        &mut self,
+        is_enabled: impl Fn(UsageSource) -> bool,
+    ) -> anyhow::Result<Option<PollOutcome>> {
         let generation_at_dispatch = self.generation();
         let mut events = Vec::new();
         for parser in &mut self.parsers {
+            // 표시를 끈(비활성) 소스는 폴링하지 않는다.
+            if !is_enabled(parser.source()) {
+                continue;
+            }
             events.extend(parser.read_delta()?);
         }
         self.commit_events_if_fresh(generation_at_dispatch, events)
@@ -131,7 +138,7 @@ impl UsageScheduler {
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            if let Some(outcome) = self.poll_once()? {
+            if let Some(outcome) = self.poll_once(|_| true)? {
                 on_outcome(outcome);
             }
         }
@@ -159,12 +166,25 @@ mod tests {
     use chrono::TimeZone;
     use std::sync::atomic::AtomicBool;
 
-    #[derive(Default)]
     struct FakeParser {
+        source: UsageSource,
         events: Vec<UsageEvent>,
     }
 
+    impl Default for FakeParser {
+        fn default() -> Self {
+            Self {
+                source: UsageSource::ClaudeCode,
+                events: Vec::new(),
+            }
+        }
+    }
+
     impl LocalLogParser for FakeParser {
+        fn source(&self) -> UsageSource {
+            self.source
+        }
+
         fn read_delta(&mut self) -> anyhow::Result<Vec<UsageEvent>> {
             Ok(std::mem::take(&mut self.events))
         }
@@ -219,6 +239,7 @@ mod tests {
     fn poll_once_reads_parser_estimates_and_records() {
         let at = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
         let parser = FakeParser {
+            source: UsageSource::Codex,
             events: vec![usage_event(UsageSource::Codex, at, 20)],
         };
         let mut scheduler = UsageScheduler::new(
@@ -226,10 +247,29 @@ mod tests {
             WindowEstimator::default(),
             UsageStore::in_memory().unwrap(),
         );
-        let outcome = scheduler.poll_once().unwrap().unwrap();
+        let outcome = scheduler.poll_once(|_| true).unwrap().unwrap();
         assert_eq!(outcome.events_read, 1);
         assert_eq!(outcome.snapshots[0].source, UsageSource::Codex);
         assert!(outcome.snapshots[0].estimated);
+    }
+
+    #[test]
+    fn poll_once_skips_disabled_sources() {
+        let at = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
+        let parser = FakeParser {
+            source: UsageSource::Codex,
+            events: vec![usage_event(UsageSource::Codex, at, 20)],
+        };
+        let mut scheduler = UsageScheduler::new(
+            vec![Box::new(parser)],
+            WindowEstimator::default(),
+            UsageStore::in_memory().unwrap(),
+        );
+        // 코덱스를 끄면 폴링되지 않아 결과가 없다.
+        let outcome = scheduler
+            .poll_once(|source| source != UsageSource::Codex)
+            .unwrap();
+        assert!(outcome.is_none());
     }
 
     #[test]

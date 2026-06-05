@@ -34,7 +34,8 @@ pub fn start_background_runtime<R: tauri::Runtime>(app: AppHandle<R>) -> anyhow:
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            match scheduler.poll_once() {
+            let enabled = load_settings();
+            match scheduler.poll_once(|source| source_enabled(&enabled, source)) {
                 Ok(Some(outcome)) => {
                     let app_for_outcome = app.clone();
                     let snapshots_for_outcome = outcome.snapshots.clone();
@@ -127,17 +128,34 @@ fn handle_outcome<R: tauri::Runtime>(
     Ok(())
 }
 
+fn source_enabled(settings: &crate::settings::AppSettings, source: UsageSource) -> bool {
+    match source {
+        UsageSource::ClaudeCode => settings.claude_code.enabled,
+        UsageSource::Codex => settings.codex.enabled,
+    }
+}
+
 fn publish_tray_state<R: tauri::Runtime>(
     app: &AppHandle<R>,
     snapshots: &[crate::window_estimator::UsageSnapshot],
 ) -> anyhow::Result<crate::settings::AppSettings> {
     let settings = load_settings();
     let mut tray_state = TrayDisplayState::from_snapshots(snapshots, Utc::now());
-    apply_live_claude_rate_limit(
-        &mut tray_state,
-        ClaudeCodeParser::latest_rate_limit_status(),
-    );
-    apply_live_codex_rate_limit(&mut tray_state, CodexParser::latest_rate_limit_status());
+
+    if settings.claude_code.enabled {
+        apply_live_claude_rate_limit(
+            &mut tray_state,
+            ClaudeCodeParser::latest_rate_limit_status(),
+        );
+    } else {
+        tray_state.cc.reset_disabled();
+    }
+    if settings.codex.enabled {
+        apply_live_codex_rate_limit(&mut tray_state, CodexParser::latest_rate_limit_status());
+    } else {
+        tray_state.cx.reset_disabled();
+    }
+
     tray_state.cc.enabled = settings.claude_code.enabled;
     tray_state.cx.enabled = settings.codex.enabled;
     update_main_tray(app, &tray_state)?;

@@ -52,6 +52,8 @@ pub struct UsageEvent {
 
 pub trait LocalLogParser {
     fn read_delta(&mut self) -> anyhow::Result<Vec<UsageEvent>>;
+    /// 이 파서가 담당하는 소스. 비활성(표시 끔) 소스의 폴링을 건너뛰는 데 쓴다.
+    fn source(&self) -> UsageSource;
 }
 
 fn parse_epoch_like_timestamp(value: i64) -> Option<DateTime<Utc>> {
