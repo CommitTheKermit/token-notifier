@@ -20,6 +20,13 @@ mod macos {
 
     const STATUS_FONT_SIZE: f64 = 8.0;
     const STATUS_LINE_HEIGHT: f64 = 9.0;
+    // 메뉴바 2줄 표시: 위(퍼센트)는 강조해 크게, 아래(갱신 시간)는 작게.
+    const PERCENT_FONT_SIZE: f64 = 12.0;
+    const PERCENT_LINE_HEIGHT: f64 = 12.0;
+    const RESET_FONT_SIZE: f64 = 7.0;
+    const RESET_LINE_HEIGHT: f64 = 8.0;
+    // 퍼센트 줄과 갱신 시간 줄 사이 세로 여백.
+    const COLUMN_ROW_GAP: f64 = 4.0;
     const STATUS_ITEM_WIDTH: f64 = 66.0;
     const POPOVER_WIDTH: f64 = 380.0;
     const POPOVER_HEIGHT: f64 = 430.0;
@@ -57,23 +64,7 @@ mod macos {
             #[unsafe(method(drawRect:))]
             fn draw_rect(&self, _dirty_rect: NSRect) {
                 let title = self.ivars().title.borrow().clone();
-                let font = status_font();
-                let attributed_title = status_attributed_title(&title, &font);
-                let bounds = self.bounds();
-                let options = NSStringDrawingOptions::UsesLineFragmentOrigin
-                    | NSStringDrawingOptions::UsesFontLeading;
-                let measured = attributed_title.boundingRectWithSize_options_context(
-                    NSSize::new(bounds.size.width, f64::INFINITY),
-                    options,
-                    None,
-                );
-                let draw_height = measured.size.height.ceil().min(bounds.size.height);
-                let y = ((bounds.size.height - draw_height) / 2.0).max(0.0);
-                let draw_rect = NSRect::new(
-                    NSPoint::new(0.0, y),
-                    NSSize::new(bounds.size.width, draw_height),
-                );
-                attributed_title.drawWithRect_options_context(draw_rect, options, None);
+                draw_status_columns(self.bounds(), &title);
             }
 
             // 클릭은 의도적으로 무시. 클릭 시 띄우던 native popover는 macOS의 detached
@@ -263,23 +254,99 @@ mod macos {
         view.setNeedsDisplay(true);
     }
 
-    fn status_font() -> Retained<NSFont> {
-        NSFont::userFixedPitchFontOfSize(STATUS_FONT_SIZE)
-            .unwrap_or_else(|| NSFont::menuBarFontOfSize(STATUS_FONT_SIZE))
+    fn status_font(size: f64) -> Retained<NSFont> {
+        NSFont::userFixedPitchFontOfSize(size).unwrap_or_else(|| NSFont::menuBarFontOfSize(size))
     }
 
-    fn status_attributed_title(
-        title: &str,
-        font: &Retained<NSFont>,
-    ) -> Retained<NSAttributedString> {
-        let paragraph = NSMutableParagraphStyle::new();
-        paragraph.setAlignment(NSTextAlignment(2));
-        paragraph.setLineBreakMode(NSLineBreakMode::ByClipping);
-        paragraph.setMinimumLineHeight(STATUS_LINE_HEIGHT);
-        paragraph.setMaximumLineHeight(STATUS_LINE_HEIGHT);
-
+    // 메뉴바 타이틀은 최대 2줄: 1줄=에이전트별 퍼센트(크게), 2줄=세션 초기화 시간(작게).
+    // 각 에이전트를 세로 컬럼으로 나눠, 같은 컬럼 폭 안에서 퍼센트/시간을 중앙정렬해 세로로 맞춘다.
+    fn draw_status_columns(bounds: NSRect, title: &str) {
         let color = NSColor::labelColor();
-        attributed_string(title, font, &color, NSTextAlignment(2))
+        let lines: Vec<&str> = title.split('\n').collect();
+        let center = NSTextAlignment(2);
+
+        // 갱신 시간 줄이 없는 fallback(예: "Token Notifier")은 전체를 한 줄 중앙정렬.
+        if lines.len() < 2 {
+            let font = status_font(STATUS_FONT_SIZE);
+            let top = ((bounds.size.height - STATUS_LINE_HEIGHT) / 2.0).max(0.0);
+            draw_text(
+                title,
+                0.0,
+                top,
+                bounds.size.width,
+                STATUS_LINE_HEIGHT,
+                &font,
+                &color,
+                center,
+                bounds,
+            );
+            return;
+        }
+
+        let percents: Vec<&str> = lines[0].split_whitespace().collect();
+        let resets: Vec<&str> = lines[1].split_whitespace().collect();
+        let columns = percents.len().max(resets.len()).max(1);
+        let column_width = bounds.size.width / columns as f64;
+        let block_height = PERCENT_LINE_HEIGHT + COLUMN_ROW_GAP + RESET_LINE_HEIGHT;
+        let top_margin = ((bounds.size.height - block_height) / 2.0).max(0.0);
+        let percent_font = status_font(PERCENT_FONT_SIZE);
+        let reset_font = status_font(RESET_FONT_SIZE);
+
+        for index in 0..columns {
+            let x = column_width * index as f64;
+            if let Some(percent) = percents.get(index) {
+                draw_centered_cell(
+                    percent,
+                    x,
+                    column_width,
+                    top_margin,
+                    PERCENT_LINE_HEIGHT,
+                    &percent_font,
+                    &color,
+                    bounds,
+                );
+            }
+            if let Some(reset) = resets.get(index) {
+                draw_centered_cell(
+                    reset,
+                    x,
+                    column_width,
+                    top_margin + PERCENT_LINE_HEIGHT + COLUMN_ROW_GAP,
+                    RESET_LINE_HEIGHT,
+                    &reset_font,
+                    &color,
+                    bounds,
+                );
+            }
+        }
+    }
+
+    // 컬럼 폭 안에서 텍스트 실제 폭을 측정해 중앙에 직접 배치한다.
+    // NSTextAlignment center 는 폰트/글자수가 다른 두 줄 사이에 미세한 오차를 남기므로,
+    // 측정 기반으로 퍼센트/시간이 같은 기준에서 정확히 세로 정렬되도록 한다.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_centered_cell(
+        text: &str,
+        column_x: f64,
+        column_width: f64,
+        top: f64,
+        height: f64,
+        font: &Retained<NSFont>,
+        color: &NSColor,
+        bounds: NSRect,
+    ) {
+        let attributed = attributed_string(text, font, color, NSTextAlignment(0));
+        let options = NSStringDrawingOptions::UsesLineFragmentOrigin
+            | NSStringDrawingOptions::UsesFontLeading;
+        let measured = attributed.boundingRectWithSize_options_context(
+            NSSize::new(column_width, f64::INFINITY),
+            options,
+            None,
+        );
+        let text_width = measured.size.width.min(column_width);
+        let x = column_x + ((column_width - text_width) / 2.0).max(0.0);
+        let rect = rect_from_top(x, top, text_width + 1.0, height, bounds);
+        attributed.drawWithRect_options_context(rect, options, None);
     }
 
     fn draw_popover_content(bounds: NSRect, state: &NativePopoverState) {

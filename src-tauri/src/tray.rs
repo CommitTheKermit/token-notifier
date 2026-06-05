@@ -281,13 +281,13 @@ fn push_grid_source_label(
         .map(|value| format!("{value}%"))
         .unwrap_or_else(|| "--%".to_string());
     let estimate = if source.estimated { "~" } else { "" };
-    percents.push(fixed_grid_cell(&format!("{estimate}{percent}")));
-    reset_hours.push(fixed_grid_cell(
-        &source
+    percents.push(format!("{estimate}{percent}"));
+    reset_hours.push(
+        source
             .reset_at
             .map(|reset_at| format_reset_hours(now, reset_at))
             .unwrap_or_else(|| "--h".to_string()),
-    ));
+    );
 }
 
 fn source_percent_text(source: &SourceTrayState) -> String {
@@ -328,10 +328,6 @@ fn push_source_label(parts: &mut Vec<String>, source: &SourceTrayState, now: Dat
         .map(|reset_at| format!("↻{}", format_countdown(now, reset_at)))
         .unwrap_or_else(|| "↻--".to_string());
     parts.push(format!("{prefix} {estimate}{percent} {reset}"));
-}
-
-fn fixed_grid_cell(value: &str) -> String {
-    format!("{value:>6}")
 }
 
 fn format_reset_hours(now: DateTime<Utc>, reset_at: DateTime<Utc>) -> String {
@@ -379,7 +375,7 @@ mod tests {
         state.cx.percent_used = Some(82);
         state.cx.reset_at = Some(now + Duration::hours(1));
 
-        assert_eq!(format_tray_label(&state), "   47%    82%\n  3.0h   1.0h");
+        assert_eq!(format_tray_label(&state), "47% 82%\n3.0h 1.0h");
     }
 
     #[test]
@@ -389,7 +385,7 @@ mod tests {
         state.cc.percent_used = Some(73);
         state.cc.reset_at = Some(now + Duration::minutes(75));
         state.cx.enabled = false;
-        assert_eq!(format_tray_label(&state), "   73%\n  1.2h");
+        assert_eq!(format_tray_label(&state), "73%\n1.2h");
         assert_eq!(format_tray_tooltip(&state), "CC  73% ↻1h15m");
     }
 
@@ -398,7 +394,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
         let state = TrayDisplayState::empty(now);
 
-        assert_eq!(format_tray_label(&state), "   --%    --%\n   --h    --h");
+        assert_eq!(format_tray_label(&state), "--% --%\n--h --h");
         assert_eq!(
             format_tray_tooltip(&state),
             "CC 데이터 없음  CX 공식 실시간 데이터 없음"
@@ -406,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn format_tray_label_keeps_constant_grid_width_across_digit_counts() {
+    fn format_tray_label_packs_values_without_padding() {
         let now = Utc.with_ymd_and_hms(2026, 5, 23, 5, 0, 0).unwrap();
         let mut state = TrayDisplayState::empty(now);
         state.cc.percent_used = Some(1);
@@ -416,9 +412,7 @@ mod tests {
 
         let label = format_tray_label(&state);
         let lines = label.lines().collect::<Vec<_>>();
-        assert_eq!(lines, ["    1%   100%", "  1.0h 100.0h"]);
-        assert_eq!(lines[0].chars().count(), lines[1].chars().count());
-        assert_eq!(lines[0].chars().count(), 13);
+        assert_eq!(lines, ["1% 100%", "1.0h 100.0h"]);
     }
 
     #[test]
