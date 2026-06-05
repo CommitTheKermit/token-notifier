@@ -287,10 +287,19 @@ mod macos {
         let resets: Vec<&str> = lines[1].split_whitespace().collect();
         let columns = percents.len().max(resets.len()).max(1);
         let column_width = bounds.size.width / columns as f64;
-        let block_height = PERCENT_LINE_HEIGHT + COLUMN_ROW_GAP + RESET_LINE_HEIGHT;
+
+        // 2줄 블록이 메뉴바 높이를 넘으면 폰트/여백을 통째로 비례 축소해 잘림을 막는다.
+        // (상하 1px 씩 여유를 두고 맞춘다.)
+        let natural_block = PERCENT_LINE_HEIGHT + COLUMN_ROW_GAP + RESET_LINE_HEIGHT;
+        let available = (bounds.size.height - 2.0).max(1.0);
+        let scale = (available / natural_block).min(1.0);
+        let percent_line = PERCENT_LINE_HEIGHT * scale;
+        let reset_line = RESET_LINE_HEIGHT * scale;
+        let gap = COLUMN_ROW_GAP * scale;
+        let block_height = percent_line + gap + reset_line;
         let top_margin = ((bounds.size.height - block_height) / 2.0).max(0.0);
-        let percent_font = status_font(PERCENT_FONT_SIZE);
-        let reset_font = status_font(RESET_FONT_SIZE);
+        let percent_font = status_font(PERCENT_FONT_SIZE * scale);
+        let reset_font = status_font(RESET_FONT_SIZE * scale);
 
         for index in 0..columns {
             let x = column_width * index as f64;
@@ -300,7 +309,7 @@ mod macos {
                     x,
                     column_width,
                     top_margin,
-                    PERCENT_LINE_HEIGHT,
+                    percent_line,
                     &percent_font,
                     &color,
                     bounds,
@@ -311,8 +320,8 @@ mod macos {
                     reset,
                     x,
                     column_width,
-                    top_margin + PERCENT_LINE_HEIGHT + COLUMN_ROW_GAP,
-                    RESET_LINE_HEIGHT,
+                    top_margin + percent_line + gap,
+                    reset_line,
                     &reset_font,
                     &color,
                     bounds,
