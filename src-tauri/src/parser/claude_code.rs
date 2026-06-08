@@ -23,6 +23,14 @@ const CLAUDE_OAUTH_TOKEN_ENDPOINT: &str = "https://console.anthropic.com/v1/oaut
 const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_CODE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const CLAUDE_OAUTH_DIAGNOSTIC_LOG: &str = "claude-oauth.log";
+/// Claude Code CLI 와 동일한 키체인 자격증명(`CLAUDE_CODE_KEYCHAIN_SERVICE`)을
+/// 공유하기 때문에, token-notifier 가 OAuth refresh 를 수행하면 rotating refresh
+/// token 이 회전되어 CLI 가 들고 있던 토큰이 무효화된다. 그 결과 사용자가 매일
+/// 아침 Claude Code 에서 `/login` 을 다시 요구받는 회귀가 발생했다. 따라서 refresh
+/// 를 비활성화하고 자격증명을 읽기 전용으로만 사용한다. 만료된 access token 은 CLI
+/// 가 스스로 갱신할 때 키체인에 반영되며, 다음 폴링에서 자연히 따라간다. Anthropic
+/// 이 non-rotating refresh token 으로 바꾸기 전까지 false 를 유지할 것.
+const CLAUDE_OAUTH_REFRESH_ENABLED: bool = false;
 
 static RATE_LIMIT_CACHE: OnceLock<Mutex<RateLimitMemoryCache>> = OnceLock::new();
 
@@ -411,10 +419,20 @@ fn fetch_rate_limit_status() -> anyhow::Result<Option<ClaudeRateLimitStatus>> {
             Ok(status)
         }
         Ok(UsageFetchResult::NeedsRefresh(status)) => {
-            log_claude_oauth_event(format!(
-                "usage request returned {status}; attempting OAuth refresh"
-            ));
-            refresh_and_retry_usage_status(&client, &mut credentials)
+            if CLAUDE_OAUTH_REFRESH_ENABLED {
+                log_claude_oauth_event(format!(
+                    "usage request returned {status}; attempting OAuth refresh"
+                ));
+                refresh_and_retry_usage_status(&client, &mut credentials)
+            } else {
+                // 읽기 전용 정책: refresh 시 CLI 와 공유하는 rotating refresh token 이
+                // 회전돼 CLI 세션이 무효화되므로(매일 /login 요구 원인) refresh 하지 않고
+                // 공식 데이터 없음으로 둔다. CLAUDE_OAUTH_REFRESH_ENABLED 주석 참고.
+                log_claude_oauth_event(format!(
+                    "usage request returned {status}; OAuth refresh disabled by read-only policy"
+                ));
+                Ok(None)
+            }
         }
         Err(error) => {
             log_claude_oauth_event(format!("usage request failed: {error:#}"));
