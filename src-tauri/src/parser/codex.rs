@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration as StdDuration, SystemTime};
 
@@ -19,6 +20,13 @@ const CODEX_USER_AGENT: &str = "codex-cli";
 const RATE_LIMIT_FETCH_TTL: StdDuration = StdDuration::from_secs(60);
 
 static RATE_LIMIT_CACHE: OnceLock<Mutex<RateLimitMemoryCache>> = OnceLock::new();
+
+/// wham/usage 가 401/403(토큰 만료 또는 로그아웃)을 반환하면 켜진다. 코덱스는
+/// auth.json 을 읽기 전용으로만 쓰므로(refresh/write 안 함) 토큰이 만료되면
+/// `codex login` 재로그인 전까지 공식값을 못 가져온다. 2xx 응답이 오면 다시 꺼진다.
+/// 세션파일/캐시 fallback 이 모두 비고 이 값이 켜져 있을 때만 패널이 "재로그인 필요"
+/// 힌트를 띄운다.
+static RELOGIN_HINT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Default)]
 struct RateLimitMemoryCache {
@@ -76,6 +84,11 @@ impl CodexParser {
     pub fn with_state_db_path(mut self, path: PathBuf) -> Self {
         self.state_db_path = Some(path);
         self
+    }
+
+    /// 패널/런타임이 "재로그인 필요" 힌트를 표시할지 결정할 때 읽는다.
+    pub fn needs_relogin_hint() -> bool {
+        RELOGIN_HINT.load(Ordering::Relaxed)
     }
 
     pub fn latest_rate_limit_status() -> Option<CodexRateLimitStatus> {
@@ -415,9 +428,19 @@ fn fetch_rate_limit_status() -> anyhow::Result<Option<CodexRateLimitStatus>> {
     let response = request.send()?;
     let status = response.status();
     if !status.is_success() {
+        // 401/403 은 토큰 만료/로그아웃 신호. 읽기 전용이라 codex login 재로그인
+        // 전까지 풀리지 않으므로 힌트를 켠다. 그 외(429/5xx 등)는 일시 장애로 본다.
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            RELOGIN_HINT.store(true, Ordering::Relaxed);
+        }
         eprintln!("token-notifier codex wham/usage HTTP {status}");
         return Ok(None);
     }
+    // 2xx 성공: 토큰이 유효하다는 확정 신호이므로 재로그인 힌트를 끈다.
+    RELOGIN_HINT.store(false, Ordering::Relaxed);
     let value: Value = response.json()?;
     Ok(parse_wham_usage_response(&value, Utc::now()))
 }

@@ -172,7 +172,11 @@ fn publish_tray_state<R: tauri::Runtime>(
         tray_state.cc.reset_disabled();
     }
     if settings.codex.enabled {
-        apply_live_codex_rate_limit(&mut tray_state, CodexParser::latest_rate_limit_status());
+        apply_live_codex_rate_limit(
+            &mut tray_state,
+            CodexParser::latest_rate_limit_status(),
+            CodexParser::needs_relogin_hint(),
+        );
     } else {
         tray_state.cx.reset_disabled();
     }
@@ -224,6 +228,7 @@ fn apply_live_claude_rate_limit(
 fn apply_live_codex_rate_limit(
     tray_state: &mut TrayDisplayState,
     status: Option<CodexRateLimitStatus>,
+    needs_relogin: bool,
 ) {
     match status {
         Some(status) if is_fresh_codex_observation(&status, tray_state.now) => {
@@ -250,20 +255,27 @@ fn apply_live_codex_rate_limit(
             if !has_local_estimate {
                 tray_state.cx.reset_at = None;
             }
-            tray_state.cx.status_source = Some(
-                if has_local_estimate {
-                    "local_estimate"
-                } else {
-                    "unavailable"
-                }
-                .to_string(),
-            );
             tray_state.cx.observed_at = None;
-            tray_state.cx.status_message = Some(if has_local_estimate {
-                "로컬 추정".to_string()
+            // 로컬 추정값조차 없고 원인이 토큰 만료(401/403)면 재로그인 안내를,
+            // 그 외에는 기존 로컬 추정/일반 안내를 유지한다.
+            if needs_relogin && !has_local_estimate {
+                tray_state.cx.status_source = Some("needs_relogin".to_string());
+                tray_state.cx.status_message = Some("재로그인 필요 · codex login".to_string());
             } else {
-                "공식 실시간 데이터 없음".to_string()
-            });
+                tray_state.cx.status_source = Some(
+                    if has_local_estimate {
+                        "local_estimate"
+                    } else {
+                        "unavailable"
+                    }
+                    .to_string(),
+                );
+                tray_state.cx.status_message = Some(if has_local_estimate {
+                    "로컬 추정".to_string()
+                } else {
+                    "공식 실시간 데이터 없음".to_string()
+                });
+            }
         }
     }
 }
@@ -369,6 +381,7 @@ mod tests {
                 now - Duration::minutes(4),
                 now + Duration::hours(2),
             )),
+            false,
         );
 
         assert_eq!(state.cx.percent_used, Some(58));
@@ -456,6 +469,7 @@ mod tests {
                 now - Duration::minutes(6),
                 now + Duration::hours(2),
             )),
+            false,
         );
 
         assert_eq!(state.cx.percent_used, Some(58));
@@ -472,7 +486,7 @@ mod tests {
     fn missing_codex_observation_reports_official_data_unavailable() {
         let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
         let mut state = TrayDisplayState::empty(now);
-        apply_live_codex_rate_limit(&mut state, None);
+        apply_live_codex_rate_limit(&mut state, None, false);
 
         assert_eq!(state.cx.percent_used, None);
         assert_eq!(state.cx.reset_at, None);
@@ -484,6 +498,35 @@ mod tests {
     }
 
     #[test]
+    fn missing_codex_observation_with_auth_401_hints_relogin() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
+        let mut state = TrayDisplayState::empty(now);
+        apply_live_codex_rate_limit(&mut state, None, true);
+
+        assert_eq!(state.cx.percent_used, None);
+        assert_eq!(state.cx.status_source.as_deref(), Some("needs_relogin"));
+        assert_eq!(
+            state.cx.status_message.as_deref(),
+            Some("재로그인 필요 · codex login")
+        );
+    }
+
+    #[test]
+    fn codex_local_estimate_takes_precedence_over_relogin_hint() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
+        let mut state = TrayDisplayState::empty(now);
+        state.cx.percent_used = Some(64);
+        state.cx.reset_at = Some(now + Duration::hours(4));
+        state.cx.estimated = true;
+
+        apply_live_codex_rate_limit(&mut state, None, true);
+
+        assert_eq!(state.cx.percent_used, Some(64));
+        assert_eq!(state.cx.status_source.as_deref(), Some("local_estimate"));
+        assert_eq!(state.cx.status_message.as_deref(), Some("로컬 추정"));
+    }
+
+    #[test]
     fn missing_codex_observation_preserves_local_estimate() {
         let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
         let mut state = TrayDisplayState::empty(now);
@@ -491,7 +534,7 @@ mod tests {
         state.cx.reset_at = Some(now + Duration::hours(4));
         state.cx.estimated = true;
 
-        apply_live_codex_rate_limit(&mut state, None);
+        apply_live_codex_rate_limit(&mut state, None, false);
 
         assert_eq!(state.cx.percent_used, Some(64));
         assert_eq!(state.cx.reset_at, Some(now + Duration::hours(4)));
@@ -514,6 +557,7 @@ mod tests {
                 now - Duration::minutes(6),
                 now + Duration::hours(2),
             )),
+            false,
         );
 
         assert_eq!(state.cx.percent_used, Some(58));
