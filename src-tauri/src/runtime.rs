@@ -166,6 +166,7 @@ fn publish_tray_state<R: tauri::Runtime>(
         apply_live_claude_rate_limit(
             &mut tray_state,
             ClaudeCodeParser::latest_rate_limit_status(),
+            ClaudeCodeParser::needs_relogin_hint(),
         );
     } else {
         tray_state.cc.reset_disabled();
@@ -187,6 +188,7 @@ fn publish_tray_state<R: tauri::Runtime>(
 fn apply_live_claude_rate_limit(
     tray_state: &mut TrayDisplayState,
     status: Option<ClaudeRateLimitStatus>,
+    needs_relogin: bool,
 ) {
     match status {
         Some(status) => {
@@ -199,6 +201,15 @@ fn apply_live_claude_rate_limit(
             } else {
                 "공식 확인".to_string()
             });
+        }
+        // 표시할 공식값이 없을 때, 원인이 scope 부족(403)이면 재로그인 안내를,
+        // 그 외 일시 장애(네트워크/429)면 기존 일반 안내를 띄운다.
+        None if needs_relogin => {
+            tray_state.cc.percent_used = None;
+            tray_state.cc.reset_at = None;
+            tray_state.cc.estimated = false;
+            tray_state.cc.status_source = Some("needs_relogin".to_string());
+            tray_state.cc.status_message = Some("재로그인 필요 · /login".to_string());
         }
         None => {
             tray_state.cc.percent_used = None;
@@ -381,6 +392,7 @@ mod tests {
                 reset_at: now + Duration::hours(2),
                 window_minutes: 300,
             }),
+            false,
         );
 
         assert_eq!(state.cc.percent_used, Some(0));
@@ -401,7 +413,7 @@ mod tests {
         state.cc.reset_at = Some(now + Duration::hours(4));
         state.cc.estimated = true;
 
-        apply_live_claude_rate_limit(&mut state, None);
+        apply_live_claude_rate_limit(&mut state, None, false);
 
         assert_eq!(state.cc.percent_used, None);
         assert_eq!(state.cc.reset_at, None);
@@ -413,6 +425,24 @@ mod tests {
         assert_eq!(
             state.cc.status_message.as_deref(),
             Some("공식 API 데이터 없음")
+        );
+    }
+
+    #[test]
+    fn missing_claude_observation_with_scope_403_hints_relogin() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 21, 1, 0, 0).unwrap();
+        let mut state = TrayDisplayState::empty(now);
+        state.cc.percent_used = Some(88);
+        state.cc.estimated = true;
+
+        apply_live_claude_rate_limit(&mut state, None, true);
+
+        assert_eq!(state.cc.percent_used, None);
+        assert!(!state.cc.estimated);
+        assert_eq!(state.cc.status_source.as_deref(), Some("needs_relogin"));
+        assert_eq!(
+            state.cc.status_message.as_deref(),
+            Some("재로그인 필요 · /login")
         );
     }
 

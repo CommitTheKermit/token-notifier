@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration as StdDuration, SystemTime};
 
@@ -33,6 +34,13 @@ const CLAUDE_OAUTH_DIAGNOSTIC_LOG: &str = "claude-oauth.log";
 const CLAUDE_OAUTH_REFRESH_ENABLED: bool = false;
 
 static RATE_LIMIT_CACHE: OnceLock<Mutex<RateLimitMemoryCache>> = OnceLock::new();
+
+/// usage API 가 403 Forbidden(토큰이 `user:profile` 등 필요한 scope 를 못 갖춤)을
+/// 반환하면 켜진다. refresh 가 비활성(`CLAUDE_OAUTH_REFRESH_ENABLED=false`)이라
+/// 이 상태는 Claude Code 에서 `/login` 재로그인을 해야만 풀린다. 성공(200) 응답이
+/// 오면 다시 꺼진다. 끈적하게(sticky) 유지되어 일시적 네트워크/429 동안에도 직전
+/// 판정을 보존한다. 패널이 이 값을 읽어 "재로그인 필요" 힌트를 띄운다.
+static RELOGIN_HINT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeRateLimitStatus {
@@ -88,6 +96,11 @@ impl ClaudeCodeParser {
     pub fn with_state_db_path(mut self, path: PathBuf) -> Self {
         self.state_db_path = Some(path);
         self
+    }
+
+    /// 패널/런타임이 "재로그인 필요" 힌트를 표시할지 결정할 때 읽는다.
+    pub fn needs_relogin_hint() -> bool {
+        RELOGIN_HINT.load(Ordering::Relaxed)
     }
 
     pub fn latest_rate_limit_status() -> Option<ClaudeRateLimitStatus> {
@@ -533,6 +546,9 @@ fn fetch_usage_status(
         return Ok(UsageFetchResult::NeedsRefresh(status));
     }
     if status == reqwest::StatusCode::FORBIDDEN {
+        // 토큰이 usage 엔드포인트가 요구하는 scope(user:profile 등)를 못 갖춘 상태.
+        // refresh 가 꺼져 있어 /login 재로그인 전까지 풀리지 않으므로 힌트를 켠다.
+        RELOGIN_HINT.store(true, Ordering::Relaxed);
         log_claude_oauth_event(format!(
             "usage request returned non-refreshable HTTP {status}; Claude Code /login may be required: {}",
             summarize_http_body(response.text().unwrap_or_default())
@@ -547,6 +563,8 @@ fn fetch_usage_status(
         return Ok(UsageFetchResult::Status(None));
     }
     let usage = response.json::<ClaudeUsageApiResponse>()?;
+    // 200 성공: 토큰 scope 가 충분하다는 확정 신호이므로 재로그인 힌트를 끈다.
+    RELOGIN_HINT.store(false, Ordering::Relaxed);
     Ok(UsageFetchResult::Status(parse_usage_api_response(
         &usage,
         Utc::now(),

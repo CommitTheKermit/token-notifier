@@ -304,6 +304,8 @@ fn native_popover_source(source: &SourceTrayState, now: DateTime<Utc>) -> Native
         ),
     };
 
+    let needs_attention = source.status_source.as_deref() == Some("needs_relogin");
+
     NativePopoverSourceState {
         label: label.to_string(),
         percent_text,
@@ -313,6 +315,7 @@ fn native_popover_source(source: &SourceTrayState, now: DateTime<Utc>) -> Native
         has_reset,
         fraction: f64::from(remaining) / 100.0,
         enabled: source.enabled,
+        needs_attention,
     }
 }
 

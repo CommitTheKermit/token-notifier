@@ -481,9 +481,14 @@ mod macos {
         let status = status_color(source.remaining, source.has_percent);
         let heading_top = row_top + 9.0;
 
-        // 상태 점
+        // 상태 점: 재로그인 등 조치 필요 상태는 앤버(잔량 경고색)로 강조한다.
+        let dot_color = if source.needs_attention {
+            attention_color()
+        } else {
+            status.colorWithAlphaComponent(factor)
+        };
         let dot_rect = rect_from_top(pad, heading_top + 6.0, 8.0, 8.0, bounds);
-        draw_rounded_rect(dot_rect, 4.0, &status.colorWithAlphaComponent(factor), None);
+        draw_rounded_rect(dot_rect, 4.0, &dot_color, None);
 
         // 서비스명
         let name_font = NSFont::boldSystemFontOfSize(14.0);
@@ -534,7 +539,12 @@ mod macos {
         let fill_w = (source.fraction.clamp(0.0, 1.0) * meter_w).max(0.0);
         if fill_w > 0.5 {
             let fill_rect = rect_from_top(pad, meter_top, fill_w, 6.0, bounds);
-            draw_rounded_rect(fill_rect, 3.0, &status.colorWithAlphaComponent(factor), None);
+            draw_rounded_rect(
+                fill_rect,
+                3.0,
+                &status.colorWithAlphaComponent(factor),
+                None,
+            );
         }
 
         // 다음 갱신까지
@@ -566,7 +576,13 @@ mod macos {
                 bounds,
             );
         } else {
+            // 갱신 시각이 없는 상태 메시지 줄. 조치 필요 상태는 앤버로 강조한다.
             let body_font = NSFont::systemFontOfSize(12.0);
+            let status_text_color = if source.needs_attention {
+                attention_color()
+            } else {
+                detail_color
+            };
             draw_text(
                 &source.detail,
                 pad,
@@ -574,7 +590,7 @@ mod macos {
                 width - pad * 2.0,
                 16.0,
                 &body_font,
-                &detail_color,
+                &status_text_color,
                 NSTextAlignment(0),
                 bounds,
             );
@@ -607,7 +623,13 @@ mod macos {
         // 토글 ON 색은 서비스 구분색(클로드코드=따뜻함, 코덱스=차가움)으로 어느 서비스의
         // 표시를 켜고 있는지 한눈에 보이게 한다.
         let toggle_x = width - pad - TOGGLE_W;
-        draw_toggle(bounds, toggle_x, top + 8.0, source.enabled, &service_color(index));
+        draw_toggle(
+            bounds,
+            toggle_x,
+            top + 8.0,
+            source.enabled,
+            &service_color(index),
+        );
     }
 
     fn draw_toggle(bounds: NSRect, x: f64, top: f64, on: bool, on_color: &NSColor) {
@@ -635,6 +657,11 @@ mod macos {
     }
 
     // 잔량 → 상태색. 여유는 시스템 라벨색(메뉴바에서 안 튐), 낮을수록 경고색.
+    // 사용자의 조치가 필요한 상태(재로그인 등)를 강조하는 앤버. 잔량 경고색과 통일.
+    fn attention_color() -> Retained<NSColor> {
+        srgb(0xb8, 0x7a, 0x3a)
+    }
+
     fn status_color(remaining: u8, has_percent: bool) -> Retained<NSColor> {
         if !has_percent {
             return NSColor::labelColor();
@@ -808,6 +835,8 @@ pub struct NativePopoverSourceState {
     pub has_reset: bool,
     pub fraction: f64,
     pub enabled: bool,
+    /// 재로그인 필요 등 사용자의 조치를 요구하는 상태. detail/상태 점을 앤버로 강조.
+    pub needs_attention: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
